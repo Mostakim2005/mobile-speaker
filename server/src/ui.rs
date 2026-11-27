@@ -82,7 +82,7 @@ slint::slint! {
 
                 // QR + Number-Match Pairing Card
                 Rectangle {
-                    background: #22262e;
+                    background: #22262f;
                     border-radius: 14px;
                     border-width: 1px;
                     border-color: #323846;
@@ -122,7 +122,7 @@ slint::slint! {
                             spacing: 12px;
 
                             Rectangle {
-                                background: #1e293b;
+                                background: #1d293b;
                                 border-radius: 8px;
                                 border-width: 1px;
                                 border-color: #38bdf8;
