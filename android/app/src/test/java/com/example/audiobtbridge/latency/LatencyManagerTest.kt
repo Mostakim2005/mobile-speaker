@@ -6,26 +6,31 @@ import org.junit.Test
 class LatencyManagerTest {
 
     @Test
-    fun `test low latency mode returns small buffer size`() {
+    fun `test low latency mode returns small buffer and 96kbps`() {
         val manager = LatencyManager()
-        val bufferSize = manager.getBufferSizeForMode(LatencyMode.LOW)
-        // 假設 Low Latency = 3 packets (approx 60ms)
-        assertEquals(3, bufferSize)
+        val config = manager.getConfigForMode(LatencyMode.LOW_LATENCY)
+        assertEquals(2, config.bufferSize)
+        assertEquals(96000, config.bitrate)
+        assertEquals(5, config.complexity)
     }
 
     @Test
-    fun `test balanced latency mode returns medium buffer size`() {
+    fun `test balance mode returns medium buffer and 196kbps`() {
         val manager = LatencyManager()
-        val bufferSize = manager.getBufferSizeForMode(LatencyMode.BALANCED)
-        // 假設 Balanced = 6 packets (approx 120ms)
-        assertEquals(6, bufferSize)
+        val config = manager.getConfigForMode(LatencyMode.BALANCE)
+        assertEquals(4, config.bufferSize)
+        assertEquals(196000, config.bitrate)
+        assertEquals(8, config.complexity)
     }
 
     @Test
-    fun `test high stability mode returns large buffer size`() {
+    fun `test high quality and best quality modes scale buffer and bitrate`() {
         val manager = LatencyManager()
-        val bufferSize = manager.getBufferSizeForMode(LatencyMode.HIGH_STABILITY)
-        // 假設 High Stability = 15 packets (approx 300ms)
-        assertEquals(15, bufferSize)
+        val high = manager.getConfigForMode(LatencyMode.HIGH_QUALITY)
+        val best = manager.getConfigForMode(LatencyMode.BEST_QUALITY)
+        assertEquals(6, high.bufferSize)
+        assertEquals(256000, high.bitrate)
+        assertEquals(8, best.bufferSize)
+        assertEquals(320000, best.bitrate)
     }
 }
