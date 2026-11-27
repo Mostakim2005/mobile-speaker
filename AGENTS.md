@@ -30,6 +30,8 @@
 
 ## 4. Critical Trap Pointers (1-Line Warnings Only)
 *(Key directly by `[TRAP: <Slug>]`; put full rationale and `Protected Code Anchors` in `docs/DECISIONS_AND_TRAPS.md`.)*
+* **`[TRAP: Slint-Macro-Hex-Exponent-Lexer]`:** Never use hex colors containing `<digits>e` (like `#22262e` or `#1e3a8a`) inside Rust's `slint!` macro; Rust lexes them as broken float literals.
+* **`[TRAP: JVM-Unit-Tests-Stub-OrgJson]`:** Never use `org.json.*` in pure Kotlin unit-tested helpers (`SavedPcStore`); Android's JVM test stub throws unmocked errors.
 * **`[TRAP: Pairing-Replies-Must-Use-Sender-Port]`:** Always reply to `AS2P_QR_PAIR`, `AS2P_PAIR_PROBE`, and `AS2P_PAIR_VERIFY` using the caller's exact `addr` port, never hardcoded `:12345`.
 * **`[TRAP: JNI-OnLoad-Extern-C]`:** Never put `JNI_OnLoad` outside `extern "C"` in `native-lib.cpp`; C++ name-mangling silently leaves `gJvm` null and breaks retransmission callbacks.
 * **`[TRAP: WASAPI-Loopback-Silence-Stall]`:** Never assume WASAPI loopback emits continuous frames when Windows is silent; keep warm-up silence and media-tick separation intact.

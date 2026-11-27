@@ -3,21 +3,123 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc as tokio_mpsc;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HWND};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_NULL, FindWindowW, ShowWindow, SW_HIDE};
 use windows::core::w;
 
 slint::slint! {
-    import { Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+    component M3PillButton inherits Rectangle {
+        in property <string> label;
+        in property <color> bg_color;
+        in property <color> bg_hover;
+        in property <color> fg_color;
+        in property <color> stroke_color: transparent;
+        in property <length> stroke_width: 0px;
+        in property <length> btn_height: 44px;
+        callback clicked();
+
+        height: btn_height;
+        border-radius: btn_height / 2;
+        background: area.has-hover ? bg_hover : bg_color;
+        border-color: stroke_color;
+        border-width: stroke_width;
+
+        area := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.clicked(); }
+        }
+
+        Text {
+            text: root.label;
+            color: root.fg_color;
+            font-size: 13px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    component M3ToggleRow inherits Rectangle {
+        in property <string> title;
+        in property <string> subtitle;
+        in-out property <bool> checked: false;
+        in property <color> card_bg;
+        in property <color> title_color;
+        in property <color> sub_color;
+        in property <color> accent_bg;
+        in property <color> accent_fg;
+        in property <color> track_off_bg;
+        in property <color> border_col;
+        callback toggled(bool);
+
+        height: 48px;
+        border-radius: 14px;
+        background: card_bg;
+        border-width: 1px;
+        border-color: border_col;
+
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            spacing: 10px;
+            alignment: space-between;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                Text {
+                    text: root.title;
+                    color: root.title_color;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+                if root.subtitle != "" : Text {
+                    text: root.subtitle;
+                    color: root.sub_color;
+                    font-size: 10px;
+                }
+            }
+
+            Rectangle {
+                width: 44px;
+                height: 24px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 12px;
+                background: root.checked ? root.accent_bg : root.track_off_bg;
+
+                Rectangle {
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 9px;
+                    y: 3px;
+                    x: root.checked ? 23px : 3px;
+                    background: root.checked ? root.accent_fg : #ffffff;
+                }
+            }
+        }
+    }
 
     export component AppWindow inherits Window {
-        in property <string> status_text: "Idle";
+        in property <bool> is_dark: true;
+        in property <string> status_text: "Ready";
         in property <bool> is_streaming: false;
-        in property <string> bitrate_text: "128000 bps";
+        in property <bool> has_client: false;
+        in property <string> bitrate_text: "160000 bps";
         in property <string> packets_text: "0 packets";
-        in property <string> client_text: "None";
+        in property <string> client_text: "Waiting for phone";
         in property <image> qr_image;
         in property <string> pair_code_text: "--";
         in property <string> network_ips_text: "Detecting networks...";
+        in property <string> copy_feedback_text: "";
         in property <int> refresh_counter: 0;
         in-out property <bool> redundancy_enabled: false;
         in-out property <bool> startup_enabled: false;
@@ -28,74 +130,116 @@ slint::slint! {
         callback toggle_startup(bool);
         callback toggle_require_pairing(bool);
         callback refresh_pairing();
+        callback copy_pair_code();
+
+        // Google Cobalt Material 3 Tonal Tokens (Light & Dark parity)
+        property <color> bg_surface: root.is_dark ? #0b0f17 : #f6f8fc;
+        property <color> card_surface: root.is_dark ? #121826 : #ffffff;
+        property <color> tonal_surface: root.is_dark ? #192234 : #edf2fa;
+        property <color> border_subtle: root.is_dark ? #334155 : #cbd5e1;
+        property <color> text_primary: root.is_dark ? #f1f5f9 : #111827;
+        property <color> text_secondary: root.is_dark ? #cbd5e1 : #475569;
+        property <color> text_muted: root.is_dark ? #94a3b8 : #526075;
+        property <color> accent: root.is_dark ? #93c5fd : #1d4ed8;
+        property <color> accent_hover: root.is_dark ? #bfdbfe : #1d40af;
+        property <color> accent_text: root.is_dark ? #0b1220 : #ffffff;
+        property <color> accent_soft: root.is_dark ? #1d3a8a : #dbeafe;
+        property <color> accent_soft_text: root.is_dark ? #dbeafe : #1d3a8a;
+        property <color> ok_bg: root.is_dark ? #064e3b : #d1fae5;
+        property <color> ok_fg: root.is_dark ? #34d399 : #047857;
+        property <color> ok_text: root.is_dark ? #d1fae5 : #065f46;
+        property <color> danger_bg: root.is_dark ? #7f1d1d : #fee2e2;
+        property <color> danger_hover: root.is_dark ? #991b1b : #fecaca;
+        property <color> danger_fg: root.is_dark ? #fee2e2 : #b91c1c;
 
         title: "AS2P_SERVER_UI";
         icon: @image-url("as2p.png");
         width: 440px;
-        height: 680px;
-        background: #181a1f;
+        height: 700px;
+        background: root.bg_surface;
 
         Rectangle {
             width: 100%;
             height: 100%;
-            background: root.refresh_counter >= 0 ? #181a1f : #181a1f;
+            background: root.refresh_counter >= 0 ? root.bg_surface : root.bg_surface;
 
             VerticalLayout {
-                padding: 22px;
+                padding: 20px;
                 spacing: 14px;
-                alignment: center;
 
+                // Header Row
                 HorizontalLayout {
-                    alignment: center;
+                    alignment: space-between;
                     spacing: 12px;
-                    Image {
-                        source: @image-url("as2p.png");
-                        width: 44px;
-                        height: 44px;
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        Text {
-                            text: "Mobile Speaker Server";
-                            font-size: 20px;
-                            font-weight: 800;
-                            color: #ffffff;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Image {
+                            source: @image-url("as2p.png");
+                            width: 40px;
+                            height: 40px;
+                            y: (parent.height - self.height) / 2;
                         }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Rectangle {
-                                width: 10px;
-                                height: 10px;
-                                border-radius: 5px;
-                                background: root.is_streaming ? #22c55e : #ef4444;
-                                y: (parent.height - self.height) / 2;
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: "Mobile Speaker";
+                                font-size: 19px;
+                                font-weight: 800;
+                                color: root.text_primary;
                             }
                             Text {
-                                text: root.status_text;
-                                color: root.is_streaming ? #4ade80 : #f87171;
-                                font-size: 13px;
+                                text: root.has_client ? ("Streaming · " + root.client_text) : "PC Audio Bridge";
+                                font-size: 11px;
+                                color: root.text_muted;
+                            }
+                        }
+                    }
+
+                    // Status Pill
+                    Rectangle {
+                        height: 30px;
+                        border-radius: 15px;
+                        y: (parent.height - self.height) / 2;
+                        background: root.has_client ? root.ok_bg : (root.is_streaming ? root.accent_soft : root.tonal_surface);
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 6px;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                y: (parent.height - self.height) / 2;
+                                background: root.has_client ? root.ok_fg : (root.is_streaming ? root.accent : root.text_muted);
+                            }
+                            Text {
+                                text: root.has_client ? "Connected" : root.status_text;
+                                color: root.has_client ? root.ok_text : (root.is_streaming ? root.accent_soft_text : root.text_secondary);
+                                font-size: 12px;
                                 font-weight: 700;
+                                vertical-alignment: center;
                             }
                         }
                     }
                 }
 
-                // QR + Number-Match Pairing Card
+                // QR + Number-Match Tonal Card
                 Rectangle {
-                    background: #22262f;
-                    border-radius: 14px;
+                    background: root.card_surface;
+                    border-radius: 24px;
                     border-width: 1px;
-                    border-color: #323846;
+                    border-color: root.border_subtle;
 
                     VerticalLayout {
-                        padding: 16px;
-                        spacing: 10px;
+                        padding: 18px;
+                        spacing: 12px;
                         alignment: center;
 
                         Text {
-                            text: "Scan QR or Match Number on Phone";
-                            color: #cbd5e1;
-                            font-size: 13px;
+                            text: "Scan QR or Match Number in Mobile Speaker";
+                            color: root.text_secondary;
+                            font-size: 12px;
                             font-weight: 600;
                             horizontal-alignment: center;
                         }
@@ -106,51 +250,68 @@ slint::slint! {
                                 width: 184px;
                                 height: 184px;
                                 background: #ffffff;
-                                border-radius: 10px;
+                                border-radius: 16px;
+                                border-width: 1px;
+                                border-color: root.border_subtle;
                                 Image {
                                     source: root.qr_image;
-                                    width: 172px;
-                                    height: 172px;
-                                    x: 6px;
-                                    y: 6px;
+                                    width: 170px;
+                                    height: 170px;
+                                    x: 7px;
+                                    y: 7px;
                                 }
                             }
                         }
 
                         HorizontalLayout {
                             alignment: center;
-                            spacing: 12px;
+                            spacing: 10px;
 
                             Rectangle {
-                                background: #1d293b;
-                                border-radius: 8px;
-                                border-width: 1px;
-                                border-color: #38bdf8;
-                                height: 38px;
+                                background: root.accent_soft;
+                                border-radius: 18px;
+                                height: 36px;
                                 HorizontalLayout {
-                                    padding-left: 14px;
-                                    padding-right: 14px;
-                                    alignment: center;
+                                    padding-left: 16px;
+                                    padding-right: 16px;
                                     Text {
-                                        text: "Pair Code: " + root.pair_code_text;
-                                        color: #38bdf8;
-                                        font-size: 16px;
+                                        text: "Match Code: " + root.pair_code_text;
+                                        color: root.accent_soft_text;
+                                        font-size: 15px;
                                         font-weight: 800;
                                         vertical-alignment: center;
                                     }
                                 }
                             }
 
-                            Button {
-                                text: "New Code / QR";
-                                height: 38px;
+                            M3PillButton {
+                                width: 92px;
+                                btn_height: 36px;
+                                label: root.copy_feedback_text != "" ? root.copy_feedback_text : "Copy Code";
+                                bg_color: root.tonal_surface;
+                                bg_hover: root.border_subtle;
+                                fg_color: root.text_primary;
+                                stroke_color: root.border_subtle;
+                                stroke_width: 1px;
+                                clicked => { root.copy_pair_code(); }
+                            }
+
+                            M3PillButton {
+                                width: 92px;
+                                btn_height: 36px;
+                                label: "New QR";
+                                bg_color: root.tonal_surface;
+                                bg_hover: root.border_subtle;
+                                fg_color: root.text_primary;
+                                stroke_color: root.border_subtle;
+                                stroke_width: 1px;
                                 clicked => { root.refresh_pairing(); }
                             }
                         }
 
                         Text {
-                            text: "IPs: " + root.network_ips_text;
-                            color: #94a3b8;
+                            text: "Reachable IPs: " + root.network_ips_text;
+                            color: root.text_muted;
                             font-size: 11px;
                             horizontal-alignment: center;
                             wrap: word-wrap;
@@ -158,84 +319,69 @@ slint::slint! {
                     }
                 }
 
-                Button {
-                    text: root.is_streaming ? "STOP LISTENING / STREAM" : "START LISTENING";
-                    primary: true;
-                    height: 44px;
+                // Primary Hero Pill Action
+                M3PillButton {
+                    btn_height: 48px;
+                    label: root.is_streaming ? "Stop Listening" : "Start Listening";
+                    bg_color: root.is_streaming ? root.danger_bg : root.accent;
+                    bg_hover: root.is_streaming ? root.danger_hover : root.accent_hover;
+                    fg_color: root.is_streaming ? root.danger_fg : root.accent_text;
                     clicked => { root.toggle_server(); }
                 }
 
-                // Toggles & Telemetry
+                // Settings Section
                 VerticalLayout {
-                    spacing: 10px;
-                    alignment: center;
+                    spacing: 8px;
 
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 10px;
-                        Text { text: "Require QR / Code Pairing:"; color: #cbd5e1; font-size: 13px; vertical-alignment: center; }
-                        Rectangle {
-                            width: 20px;
-                            height: 20px;
-                            background: root.require_pairing_enabled ? #38bdf8 : #444444;
-                            border-radius: 4px;
-                            TouchArea {
-                                clicked => {
-                                    root.require_pairing_enabled = !root.require_pairing_enabled;
-                                    root.toggle_require_pairing(root.require_pairing_enabled);
-                                }
-                            }
-                            Text { text: root.require_pairing_enabled ? "✔" : ""; color: black; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        }
+                    M3ToggleRow {
+                        title: "Require QR / Code Pairing";
+                        subtitle: "Blocks unpaired devices on shared Wi-Fi";
+                        checked <=> root.require_pairing_enabled;
+                        card_bg: root.card_surface;
+                        title_color: root.text_primary;
+                        sub_color: root.text_muted;
+                        accent_bg: root.accent;
+                        accent_fg: root.accent_text;
+                        track_off_bg: root.border_subtle;
+                        border_col: root.border_subtle;
+                        toggled(val) => { root.toggle_require_pairing(val); }
                     }
 
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 10px;
-                        Text { text: "Double Send Redundancy:"; color: #cbd5e1; font-size: 13px; vertical-alignment: center; }
-                        Rectangle {
-                            width: 20px;
-                            height: 20px;
-                            background: root.redundancy_enabled ? #22c55e : #444444;
-                            border-radius: 4px;
-                            TouchArea {
-                                clicked => {
-                                    root.redundancy_enabled = !root.redundancy_enabled;
-                                    root.toggle_redundancy(root.redundancy_enabled);
-                                }
-                            }
-                            Text { text: root.redundancy_enabled ? "✔" : ""; color: black; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        }
+                    M3ToggleRow {
+                        title: "Double Send Redundancy";
+                        subtitle: "Extra packet backup on noisy Wi-Fi";
+                        checked <=> root.redundancy_enabled;
+                        card_bg: root.card_surface;
+                        title_color: root.text_primary;
+                        sub_color: root.text_muted;
+                        accent_bg: root.accent;
+                        accent_fg: root.accent_text;
+                        track_off_bg: root.border_subtle;
+                        border_col: root.border_subtle;
+                        toggled(val) => { root.toggle_redundancy(val); }
                     }
 
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 10px;
-                        Text { text: "Run at Startup:"; color: #cbd5e1; font-size: 13px; vertical-alignment: center; }
-                        Rectangle {
-                            width: 20px;
-                            height: 20px;
-                            background: root.startup_enabled ? #22c55e : #444444;
-                            border-radius: 4px;
-                            TouchArea {
-                                clicked => {
-                                    root.startup_enabled = !root.startup_enabled;
-                                    root.toggle_startup(root.startup_enabled);
-                                }
-                            }
-                            Text { text: root.startup_enabled ? "✔" : ""; color: black; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                    }
-
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 18px;
-                        Text { text: "Bitrate: " + root.bitrate_text; color: #94a3b8; font-size: 12px; }
-                        Text { text: "Client: " + root.client_text; color: #94a3b8; font-size: 12px; }
+                    M3ToggleRow {
+                        title: "Run at Windows Startup";
+                        subtitle: "Start silently in system tray";
+                        checked <=> root.startup_enabled;
+                        card_bg: root.card_surface;
+                        title_color: root.text_primary;
+                        sub_color: root.text_muted;
+                        accent_bg: root.accent;
+                        accent_fg: root.accent_text;
+                        track_off_bg: root.border_subtle;
+                        border_col: root.border_subtle;
+                        toggled(val) => { root.toggle_startup(val); }
                     }
                 }
 
-                Text { text: "Closing minimizes to Windows System Tray"; font-size: 11px; color: #64748b; horizontal-alignment: center; }
+                // Footer Telemetry
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text { text: "Bitrate: " + root.bitrate_text; color: root.text_muted; font-size: 11px; }
+                    Text { text: "Minimized to Tray on Close"; color: root.text_muted; font-size: 11px; }
+                }
             }
         }
     }
@@ -266,6 +412,27 @@ pub struct UiState {
     pub cmd_tx: tokio_mpsc::Sender<UiCommand>,
     pub is_ui_visible: Arc<AtomicBool>,
     pub main_thread_id: u32,
+}
+
+fn detect_windows_dark_mode() -> bool {
+    let mut buffer: u32 = 0;
+    let mut cb_data: u32 = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut buffer as *mut u32 as *mut std::ffi::c_void),
+            Some(&mut cb_data),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        buffer == 0
+    } else {
+        true
+    }
 }
 
 fn check_startup_status() -> bool {
@@ -307,6 +474,7 @@ pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<A
 
     let _ = handle_tx.send(window.as_weak());
 
+    window.set_is_dark(detect_windows_dark_mode());
     window.set_startup_enabled(check_startup_status());
 
     let is_visible_on_close = state.is_ui_visible.clone();
@@ -334,6 +502,21 @@ pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<A
     let cmd_tx_refresh = state.cmd_tx.clone();
     window.on_refresh_pairing(move || { let _ = cmd_tx_refresh.try_send(UiCommand::RefreshPairing); });
 
+    let window_weak_copy = window.as_weak();
+    let copy_clear_ticks = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let copy_ticks_clone = copy_clear_ticks.clone();
+    window.on_copy_pair_code(move || {
+        if let Some(ui) = window_weak_copy.upgrade() {
+            let code = ui.get_pair_code_text().to_string();
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                if cb.set_text(code).is_ok() {
+                    ui.set_copy_feedback_text("Copied!".into());
+                    copy_ticks_clone.store(8, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+
     let window_weak_startup = window.as_weak();
     window.on_toggle_startup(move |enabled| {
         set_startup(enabled);
@@ -351,20 +534,41 @@ pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<A
     let is_running_timer = state.is_running.clone();
     let stats_rx_timer = state.stats_rx.clone();
     let timer = slint::Timer::default();
+    let mut theme_poll_counter: u8 = 0;
 
     window.set_refresh_counter(1);
 
     timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(250), move || {
         if let Some(ui) = window_weak.upgrade() {
+            theme_poll_counter = theme_poll_counter.wrapping_add(1);
+            if theme_poll_counter % 8 == 0 {
+                ui.set_is_dark(detect_windows_dark_mode());
+            }
+
+            let left = copy_clear_ticks.load(Ordering::SeqCst);
+            if left > 0 {
+                let next = left - 1;
+                copy_clear_ticks.store(next, Ordering::SeqCst);
+                if next == 0 {
+                    ui.set_copy_feedback_text("".into());
+                }
+            }
+
             let running = is_running_timer.load(Ordering::SeqCst);
             ui.set_is_streaming(running);
-            ui.set_status_text(if running { "Listening / Active".into() } else { "Idle".into() });
+            ui.set_status_text(if running { "Listening".into() } else { "Paused".into() });
             while let Ok(msg) = stats_rx_timer.try_recv() {
                 match msg {
                     UiMessage::UpdateStats { packets, bitrate, client_ip } => {
                         ui.set_packets_text(format!("{} packets", packets).into());
-                        ui.set_bitrate_text(format!("{} bps", bitrate).into());
-                        ui.set_client_text(client_ip.unwrap_or_else(|| "None".to_string()).into());
+                        if bitrate > 0 {
+                            ui.set_bitrate_text(format!("{} kbps", bitrate / 1000).into());
+                        } else {
+                            ui.set_bitrate_text("160 kbps".into());
+                        }
+                        let has = client_ip.is_some();
+                        ui.set_has_client(has);
+                        ui.set_client_text(client_ip.unwrap_or_else(|| "Waiting for phone".to_string()).into());
                     }
                     UiMessage::SyncRedundancy(enabled) => {
                         ui.set_redundancy_enabled(enabled);

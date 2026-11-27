@@ -11,6 +11,14 @@
   * **Rejected / Waived:** Custom Go/Python/TS audio engine from scratch (reinventing adaptive jitter buffer + Oboe), or `mkckr0/audio-share` (uncompressed PCM lacks Wi-Fi packet-loss resilience and adaptive retransmission for YouTube/movies).
   * **Chosen:** Fork AS2P (`upstream`), keep its Rust+Oboe+Opus core intact, and build QR pairing, Google-style number matching, hotspot/USB reliability, and polished UI on top.
 
+### [DECISION: Material-You-Dynamic-And-Cobalt-M3] | Aliases: material you, google cobalt, system theme, dynamic color
+> **1-Line Summary:** Adopted Android 12+ Material You Dynamic Color with Google Cobalt M3 Light/Dark fallbacks (mirroring `m3-tokens`) driven automatically by the OS system theme.
+* **Links:** `[FEATURE: Material-You-And-Saved-PCs]`, `[FLOW: Material-You-Theme-And-Saved-PCs]`
+* **Decision Maker:** `[DECIDED BY: HUMAN]`
+* **Options Considered:**
+  * **Rejected / Waived:** Custom in-app Light/Dark manual switch (`Bravo 2` chose OS system theme only), raw neon-cyan dark UI, and `adb reverse` Phase 2 work (skipped).
+  * **Chosen:** `dynamicLightColorScheme`/`dynamicDarkColorScheme` on Android 12+, Google Cobalt M3 palette on Android 9–11 & Windows Slint (`AppsUseLightTheme`), plus Saved PCs, sync pill/sparkline, and Tuning bottom sheet.
+
 ### [DECISION: GitHub-First-Public-Repo] | Aliases: github actions, ci.yml, public repo, artifacts
 > **1-Line Summary:** Upgraded Mobile Speaker from Local-Only to a public GitHub-First repository (`Mostakim2005/mobile-speaker`) so GitHub Actions builds Rust Windows binaries and Android APKs cleanly in the cloud.
 * **Links:** `[SUBSYSTEM: Audio-Transport-And-Sync]`
@@ -22,6 +30,22 @@
 ---
 
 ## 2. Do-Not-Touch Engineering Landmines (Traps)
+
+### [TRAP: Slint-Macro-Hex-Exponent-Lexer] | Aliases: expected at least one digit in exponent, slint hex color, rust macro lexer
+> **1-Line Summary:** Never write hex color literals inside Rust `slint::slint!` whose digits end with `e` or `E` (such as `#22262e` or `#1e3a8a`) because Rust's tokenizer mistakes them for malformed scientific-notation floats.
+* **Links:** `[FEATURE: Material-You-And-Saved-PCs]`, `[FLOW: Material-You-Theme-And-Saved-PCs]`
+* **Strict Rule:** **NEVER** place `<digits>[eE]` hex literals like `#22262e` or `#1e3a8a` inside `slint::slint! { ... }` in `server/src/ui.rs`; adjust by 1 hex step (e.g., `#1d3a8a`) or use `rgb()`.
+* **Why This Trap Exists (Plain English):** Rust tokenizes macro input before Slint parses it, so `#1e3a8a` is lexed as float `1e3` with invalid suffix `a8a` and fails compilation.
+* **Protected Code Anchors:**
+  * `server/src/ui.rs :: AppWindow`
+
+### [TRAP: JVM-Unit-Tests-Stub-OrgJson] | Aliases: org.json not mocked, saved pc serializer, jvm unit test
+> **1-Line Summary:** Android's plain JVM unit-test stub throws `"Method ... not mocked"` for `org.json.JSONArray`/`JSONObject`; keep `SavedPcStore` serialization in pure Kotlin TSV helpers.
+* **Links:** `[FEATURE: Material-You-And-Saved-PCs]`, `[FLOW: Material-You-Theme-And-Saved-PCs]`
+* **Strict Rule:** **NEVER** call `org.json.*` inside pure-Kotlin logic tested by `testDebugUnitTest` without Robolectric.
+* **Why This Trap Exists (Plain English):** `android.jar` in local JVM unit tests contains throwing stubs for Android SDK classes including `org.json`. Pure Kotlin TSV string serialization runs cleanly in both unit tests and on devices.
+* **Protected Code Anchors:**
+  * `android/app/src/main/kotlin/com/example/audiobtbridge/SavedPcStore.kt :: serialize`
 
 ### [TRAP: Pairing-Replies-Must-Use-Sender-Port] | Aliases: ephemeral port, qr pair timeout, pairing reply, symmetric port
 > **1-Line Summary:** Pairing handshake replies (`AS2P_PAIR_CHALLENGE`, `AS2P_PAIR_ACK`, `AS2P_PAIR_DENY`, `AS2P_PAIR_REQUIRED`) MUST go back to the caller's exact `SocketAddr` (`addr`), never hardcoded `:12345`.
