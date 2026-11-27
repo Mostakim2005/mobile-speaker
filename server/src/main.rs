@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
-use std::sync::{Arc};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc as tokio_mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +21,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
 use windows::Win32::Foundation::HWND;
-use windows::core::{w};
-use crossbeam_channel::{unbounded};
+use windows::core::w;
+use crossbeam_channel::{unbounded, Sender as CrossbeamSender};
 use slint::ComponentHandle;
 use image::ImageReader;
 use std::io::Cursor;
@@ -28,13 +30,17 @@ use clap::Parser;
 use colored::*;
 
 mod audio;
+mod discovery;
 mod encoder;
 mod network;
+mod pairing;
 mod ui;
 
 use crate::audio::{AudioCapturer, CaptureEvent};
+use crate::discovery::DiscoveryServer;
 use crate::encoder::{create_encoder, encode_frame, configure_encoder, validate_config};
 use crate::network::{parse_resend_request, ResendCache, UdpSender};
+use crate::pairing::{default_host_name, list_candidate_ipv4s, PairingOutcome, PairingSession};
 use crate::ui::{UiMessage, UiCommand, UiState, AppWindow};
 
 #[derive(Parser, Debug)]
@@ -62,11 +68,6 @@ enum WorkerCommand {
 }
 
 /// Send-side counters plus the client's own measurements.
-///
-/// The client reports its view (latency, loss, underruns) in `AS2P_STATS`
-/// packets; the server cannot infer any of that from its own send path, and
-/// without it there is no way to tell whether the adaptive buffer is actually
-/// helping or just adding latency.
 #[derive(Default)]
 struct StreamStats {
     packets_sent: std::sync::atomic::AtomicU64,
@@ -81,9 +82,6 @@ struct StreamStats {
     client_underflows: std::sync::atomic::AtomicU32,
 }
 
-/// `AS2P_STATS` + 5 x u32 (little-endian):
-/// max latency ms, average latency ms, late-packet percent x100,
-/// packet-loss percent x100, underflow count.
 const STATS_PREFIX: &[u8] = b"AS2P_STATS";
 const STATS_LEN: usize = 10 + 5 * 4;
 
@@ -97,6 +95,26 @@ fn parse_client_stats(buf: &[u8]) -> Option<[u32; 5]> {
         *slot = u32::from_le_bytes(buf[start..start + 4].try_into().ok()?);
     }
     Some(out)
+}
+
+fn push_pairing_to_ui(tx: &CrossbeamSender<UiMessage>, session: &PairingSession, ips: &[Ipv4Addr]) {
+    let payload = session.build_qr_uri(ips, 12345);
+    let (qr_size, _, qr_rgba) = PairingSession::render_qr_rgba(&payload, 172)
+        .unwrap_or_else(|_| (0, 0, Vec::new()));
+    let ips_summary = if ips.is_empty() {
+        "No active LAN / Hotspot IPv4".to_string()
+    } else if ips.len() <= 3 {
+        ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(" • ")
+    } else {
+        let head = ips.iter().take(3).map(|ip| ip.to_string()).collect::<Vec<_>>().join(" • ");
+        format!("{} (+{})", head, ips.len() - 3)
+    };
+    let _ = tx.send(UiMessage::UpdatePairing {
+        qr_rgba,
+        qr_size,
+        match_code: session.match_code,
+        ips_summary,
+    });
 }
 
 fn load_embedded_icon() -> Icon {
@@ -128,8 +146,7 @@ fn force_window_redraw(hwnd: HWND, ui_weak: &slint::Weak<AppWindow>) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    
-    // 1. Elevate Process Priority (Real-time Mitigation)
+
     unsafe {
         let handle = GetCurrentProcess();
         if let Err(e) = SetPriorityClass(handle, HIGH_PRIORITY_CLASS) {
@@ -140,12 +157,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.debug {
-        println!("{}", ">>> AS2P V8 'PULSE' SERVER (DEBUG MODE) <<<".bold().bright_white().on_blue());
+        println!("{}", ">>> MOBILE SPEAKER (AS2P) SERVER (DEBUG MODE) <<<".bold().bright_white().on_blue());
     }
 
     let is_running = Arc::new(AtomicBool::new(false));
     let (ui_stats_tx, ui_stats_rx) = unbounded::<UiMessage>();
-    let (cmd_tx, mut cmd_rx) = tokio_mpsc::channel::<UiCommand>(10);
+    let (cmd_tx, mut cmd_rx) = tokio_mpsc::channel::<UiCommand>(16);
     let is_ui_visible = Arc::new(AtomicBool::new(true));
     let main_tid = unsafe { GetCurrentThreadId() };
 
@@ -154,7 +171,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_ui_visible_ui = is_ui_visible.clone();
     let cmd_tx_ui = cmd_tx.clone();
     std::thread::spawn(move || {
-        ui::run_ui(UiState { is_running: is_running_ui, stats_rx: ui_stats_rx, cmd_tx: cmd_tx_ui, is_ui_visible: is_ui_visible_ui, main_thread_id: main_tid, }, ui_handle_tx);
+        ui::run_ui(UiState {
+            is_running: is_running_ui,
+            stats_rx: ui_stats_rx,
+            cmd_tx: cmd_tx_ui,
+            is_ui_visible: is_ui_visible_ui,
+            main_thread_id: main_tid,
+        }, ui_handle_tx);
     });
     let ui_weak = ui_handle_rx.recv().expect("Err");
 
@@ -167,24 +190,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let mut state = ServerState::Listening; // Auto-start
-            is_running_server.store(true, Ordering::SeqCst); // Sync atomic
-            
-            // Re-evaluating UI sync: 
-            // The UI thread reads `is_running` every 250ms (in run_ui -> timer).
-            // So simply setting `is_running` to true and `state` to Listening is enough for UI visual.
-            // But we need to make sure the loop logic handles this.
-            
-            // Re-evaluating UI sync: 
-            // The UI thread reads `is_running` every 250ms (in run_ui -> timer).
-            // So simply setting `is_running` to true and `state` to Listening is enough for UI visual.
-            // But we need to make sure the loop logic handles this.
-            
+            let mut state = ServerState::Listening;
+            is_running_server.store(true, Ordering::SeqCst);
+
             let mut redundancy = false;
+            let mut require_pairing = false;
             let mut current_bitrate = 160000;
             let mut current_complexity = 5;
 
-            // Delayed Startup (Defender Mitigation)
+            let _mdns_guard = DiscoveryServer::try_new().ok().and_then(|srv| {
+                match srv.start_broadcast(12345) {
+                    Ok(()) => {
+                        if debug_mode { println!("{} mDNS _as2p._udp.local. active", "[DISC]".blue()); }
+                        Some(srv)
+                    }
+                    Err(e) => {
+                        if debug_mode { println!("{} mDNS skipped: {}", "[DISC]".yellow(), e); }
+                        None
+                    }
+                }
+            });
+
+            let mut pairing = PairingSession::new(default_host_name());
+            let mut authorized_ips: HashSet<IpAddr> = HashSet::new();
+            let mut cached_ips = list_candidate_ipv4s();
+            push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+
             if debug_mode { println!("{} Initializing... (Delayed start)", "[SYS]".yellow()); }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
@@ -196,40 +227,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match cmd {
                                 UiCommand::ToggleServer => { state = ServerState::Listening; break; }
                                 UiCommand::SetRedundancy(r) => redundancy = r,
+                                UiCommand::SetRequirePairing(p) => require_pairing = p,
+                                UiCommand::RefreshPairing => {
+                                    pairing.rotate();
+                                    cached_ips = list_candidate_ipv4s();
+                                    push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+                                }
                             }
                         }
                     }
                     ServerState::Listening => {
                         is_running_server.store(true, Ordering::SeqCst);
-                        if debug_mode { println!("{} Waiting for AS2P_DISCOVER...", "[CONN]".blue()); }
-                        
+                        if debug_mode { println!("{} Waiting for QR/Number-Match or AS2P_DISCOVER...", "[CONN]".blue()); }
+
+                        cached_ips = list_candidate_ipv4s();
+                        push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+
                         let socket = Arc::new(bind_socket(12345).expect("Err"));
-                        
-                        // Flush socket buffer to prevent ghost connections
+
                         let mut flush_buf = [0u8; 1024];
                         while let Ok(_) = socket.try_recv(&mut flush_buf) {}
 
                         let mut buf = [0u8; 1024];
                         let mut target_addr: Option<std::net::SocketAddr> = None;
+                        let mut ip_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(4));
 
                         loop {
                             tokio::select! {
+                                _ = ip_refresh_interval.tick() => {
+                                    let latest = list_candidate_ipv4s();
+                                    if latest != cached_ips {
+                                        cached_ips = latest;
+                                        push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+                                    }
+                                }
                                 msg = cmd_rx.recv() => {
                                     match msg {
                                         Some(UiCommand::ToggleServer) => { state = ServerState::Idle; break; }
                                         Some(UiCommand::SetRedundancy(r)) => redundancy = r,
-                                        _ => {}
+                                        Some(UiCommand::SetRequirePairing(p)) => require_pairing = p,
+                                        Some(UiCommand::RefreshPairing) => {
+                                            pairing.rotate();
+                                            cached_ips = list_candidate_ipv4s();
+                                            push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+                                        }
+                                        None => {}
                                     }
                                 }
                                 result = socket.recv_from(&mut buf) => {
                                     if let Ok((len, addr)) = result {
+                                        if let Some(outcome) = pairing.handle_packet(&buf[..len]) {
+                                            match outcome {
+                                                PairingOutcome::ReplyOnly(reply) => {
+                                                    let _ = socket.send_to(&reply, addr).await;
+                                                }
+                                                PairingOutcome::Authorized { reply } => {
+                                                    authorized_ips.insert(addr.ip());
+                                                    target_addr = Some(std::net::SocketAddr::new(addr.ip(), 12345));
+                                                    let _ = socket.send_to(&reply, addr).await;
+                                                    if debug_mode { println!("{} Paired client {}", "[PAIR]".green(), addr.ip()); }
+                                                }
+                                                PairingOutcome::Rejected { reply } => {
+                                                    let _ = socket.send_to(&reply, addr).await;
+                                                    push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+                                                    if debug_mode { println!("{} Rejected pairing from {}", "[PAIR]".red(), addr.ip()); }
+                                                }
+                                            }
+                                            continue;
+                                        }
+
                                         if len >= 13 && &buf[0..13] == b"AS2P_DISCOVER" {
+                                            if require_pairing && !authorized_ips.contains(&addr.ip()) {
+                                                let _ = socket.send_to(b"AS2P_PAIR_REQUIRED", addr).await;
+                                                continue;
+                                            }
                                             let fixed_addr = std::net::SocketAddr::new(addr.ip(), 12345);
                                             target_addr = Some(fixed_addr);
                                             let _ = socket.send_to(b"AS2P_OFFER", fixed_addr).await;
                                             if debug_mode { println!("{} Offer sent to {}", "[CONN]".blue(), fixed_addr); }
                                         } else if len >= 16 && &buf[0..11] == b"AS2P_CONFIG" {
-                                            // Fix: Ensure target_addr is set if we receive CONFIG without DISCOVER (or race condition)
+                                            if require_pairing && !authorized_ips.contains(&addr.ip()) {
+                                                let _ = socket.send_to(b"AS2P_PAIR_REQUIRED", addr).await;
+                                                continue;
+                                            }
                                             if target_addr.is_none() {
                                                 let fixed_addr = std::net::SocketAddr::new(addr.ip(), 12345);
                                                 target_addr = Some(fixed_addr);
@@ -248,23 +328,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        
+
                         if state == ServerState::Streaming && target_addr.is_some() {
                             let target = target_addr.unwrap();
                             let (worker_cmd_tx, mut worker_cmd_rx) = tokio_mpsc::channel::<WorkerCommand>(10);
                             let (worker_stop_tx, worker_stop_rx) = tokio::sync::oneshot::channel::<()>();
-                            
+
                             let sequence_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
                             let current_bitrate_atomic = Arc::new(std::sync::atomic::AtomicI32::new(current_bitrate));
                             let stats = Arc::new(StreamStats::default());
-                            
+
                             let socket_worker = socket.clone();
                             let sequence_worker = sequence_atomic.clone();
                             let bitrate_worker = current_bitrate_atomic.clone();
                             let stats_worker = stats.clone();
                             let debug_mode_worker = debug_mode;
-                            
-                            // 0. Audio Worker Task (Decoupled Loop)
+
                             let audio_handle = tokio::spawn(async move {
                                 let mut udp_sender = UdpSender::new(socket_worker, target, debug_mode_worker, redundancy, drop_rate);
                                 let mut capturer = AudioCapturer::new(debug_mode_worker).expect("Err");
@@ -273,17 +352,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut pcm_buffer = Vec::with_capacity(1920 * 10);
                                 let mut resend_cache = ResendCache::new();
                                 let start_time = std::time::Instant::now();
-                                
-                                // Media tick counts 20 ms Opus frames. It advances only when a
-                                // frame is actually transmitted, so it stays a faithful media
-                                // timeline even if the capture loop stalls.
                                 let mut media_tick: u64 = 0;
-                                
+
                                 let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
                                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                                // Warm-up: pre-roll the client's jitter buffer so it can start
-                                // playing without waiting for the first real frames.
                                 if debug_mode_worker { println!("{} Sending initial 10 warm-up packets to {}", "[AUDIO]".green(), target); }
                                 let silence_pcm = vec![0.0f32; 1920];
                                 let silence_data = encode_frame(&mut encoder, &silence_pcm);
@@ -345,11 +418,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let _ = configure_encoder(&mut encoder, br, comp);
                                                     let _ = capturer.reinitialize();
                                                     pcm_buffer.clear();
-                                                    // Cached frames were encoded with the old
-                                                    // configuration; serving them after a
-                                                    // reconfigure would mix bitrates.
                                                     resend_cache.clear();
-                                                    
+
                                                     let silence_pcm = vec![0.0f32; 1920];
                                                     let silence_data = encode_frame(&mut encoder, &silence_pcm);
                                                     for _ in 0..10 {
@@ -368,7 +438,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 Some(WorkerCommand::Resend(tick)) => {
                                                     stats_worker.resend_requests.fetch_add(1, Ordering::Relaxed);
-                                                    // Clone out of the cache so the borrow ends before the await.
                                                     let cached = resend_cache.get(tick).map(|c| crate::network::CachedPacket {
                                                         tick: c.tick,
                                                         send_ts_ms: c.send_ts_ms,
@@ -411,19 +480,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 redundancy = r;
                                                 let _ = worker_cmd_tx.send(WorkerCommand::SetRedundancy(r)).await;
                                             }
-                                            _ => {}
+                                            Some(UiCommand::SetRequirePairing(p)) => require_pairing = p,
+                                            Some(UiCommand::RefreshPairing) => {
+                                                pairing.rotate();
+                                                cached_ips = list_candidate_ipv4s();
+                                                push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+                                            }
+                                            None => {}
                                         }
                                     }
                                     result = socket.recv_from(&mut buf) => {
-                                        if let Ok((len, _)) = result {
+                                        if let Ok((len, addr)) = result {
+                                            if let Some(outcome) = pairing.handle_packet(&buf[..len]) {
+                                                match outcome {
+                                                    PairingOutcome::ReplyOnly(reply) => {
+                                                        let _ = socket.send_to(&reply, addr).await;
+                                                    }
+                                                    PairingOutcome::Authorized { reply } => {
+                                                        authorized_ips.insert(addr.ip());
+                                                        let _ = socket.send_to(&reply, addr).await;
+                                                    }
+                                                    PairingOutcome::Rejected { reply } => {
+                                                        let _ = socket.send_to(&reply, addr).await;
+                                                        push_pairing_to_ui(&ui_stats_tx_server, &pairing, &cached_ips);
+                                                    }
+                                                }
+                                                continue;
+                                            }
+
                                             last_activity_time = std::time::Instant::now();
                                             if len >= 10 && &buf[0..10] == b"AS2P_ALIVE" {
                                                 continue;
                                             } else if let Some(tick) = parse_resend_request(&buf[..len]) {
-                                                // Receiver noticed a gap and asked for this tick back.
-                                                // Non-blocking: a full command channel only means the
-                                                // audio worker is behind, and the packet is already
-                                                // too late to be useful by the time it catches up.
                                                 let _ = worker_cmd_tx.try_send(WorkerCommand::Resend(tick));
                                             } else if let Some(client) = parse_client_stats(&buf[..len]) {
                                                 stats.client_max_latency_ms.store(client[0], Ordering::Relaxed);
@@ -453,16 +541,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                                         if last_activity_time.elapsed().as_secs() > 5 {
                                             if debug_mode { println!("{} Client connection timed out.", "[CONN]".red()); }
-                                            state = ServerState::Listening; 
-                                            break; 
+                                            state = ServerState::Listening;
+                                            break;
                                         }
-                                        
+
                                         if last_ui_update_time.elapsed().as_millis() >= 200 {
                                             if is_ui_visible_server.load(Ordering::SeqCst) {
-                                                let _ = ui_stats_tx_server.send(UiMessage::UpdateStats { 
-                                                    packets: sequence_atomic.load(Ordering::SeqCst), 
-                                                    bitrate: current_bitrate_atomic.load(Ordering::SeqCst), 
-                                                    client_ip: Some(target.to_string()) 
+                                                let _ = ui_stats_tx_server.send(UiMessage::UpdateStats {
+                                                    packets: sequence_atomic.load(Ordering::SeqCst),
+                                                    bitrate: current_bitrate_atomic.load(Ordering::SeqCst),
+                                                    client_ip: Some(target.to_string())
                                                 });
                                             }
                                             last_ui_update_time = std::time::Instant::now();
@@ -491,7 +579,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            // Cleanup Worker
                             let _ = worker_stop_tx.send(());
                             let _ = audio_handle.await;
 
@@ -515,27 +602,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &MenuItem::with_id("server_toggle", "Start/Stop Server", true, None),
         &MenuItem::with_id("quit", "Quit", true, None),
     ]);
-    
+
     let mut _tray = Some(TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_icon(load_embedded_icon())
-        .with_tooltip("AS2P Server")
+        .with_tooltip("Mobile Speaker Server")
         .build()?);
 
     let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayIconEvent::receiver();
     let mut msg = MSG::default();
-    
+
     let mut last_tray_state = false;
 
     unsafe {
         while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
             TranslateMessage(&msg); DispatchMessageW(&msg);
-            
+
             let current_running = is_running.load(Ordering::SeqCst);
             if current_running != last_tray_state {
                 if let Some(ref tray) = _tray {
-                    let _ = tray.set_tooltip(Some(if current_running { "AS2P Server (Streaming)" } else { "AS2P Server (Idle)" }));
+                    let _ = tray.set_tooltip(Some(if current_running { "Mobile Speaker (Active)" } else { "Mobile Speaker (Idle)" }));
                 }
                 last_tray_state = current_running;
             }
@@ -543,14 +630,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hwnd = FindWindowW(None, w!("AS2P_SERVER_UI")).unwrap_or(HWND(std::ptr::null_mut()));
             let visible = !hwnd.0.is_null() && IsWindowVisible(hwnd).as_bool();
             is_ui_visible.store(visible, Ordering::SeqCst);
-            
+
             while let Ok(event) = menu_channel.try_recv() {
                 match event.id.0.as_str() {
                     "toggle" => { if !hwnd.0.is_null() { if visible { ShowWindow(hwnd, SW_HIDE); } else { force_window_redraw(hwnd, &ui_weak); } } }
                     "server_toggle" => { let _ = cmd_tx.try_send(UiCommand::ToggleServer); }
                     "quit" => {
-                        _tray.take(); // 關鍵：先手動移除圖示
-                        PostQuitMessage(0); // 讓主迴圈結束
+                        _tray.take();
+                        PostQuitMessage(0);
                     }
                     _ => {}
                 }

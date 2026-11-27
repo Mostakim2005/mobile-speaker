@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc as tokio_mpsc;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_NULL, FindWindowW, ShowWindow, SW_HIDE};
 use windows::core::w;
 
@@ -15,129 +15,227 @@ slint::slint! {
         in property <string> bitrate_text: "128000 bps";
         in property <string> packets_text: "0 packets";
         in property <string> client_text: "None";
+        in property <image> qr_image;
+        in property <string> pair_code_text: "--";
+        in property <string> network_ips_text: "Detecting networks...";
         in property <int> refresh_counter: 0;
         in-out property <bool> redundancy_enabled: false;
         in-out property <bool> startup_enabled: false;
+        in-out property <bool> require_pairing_enabled: false;
 
         callback toggle_server();
         callback toggle_redundancy(bool);
         callback toggle_startup(bool);
+        callback toggle_require_pairing(bool);
+        callback refresh_pairing();
 
         title: "AS2P_SERVER_UI";
         icon: @image-url("as2p.png");
-        width: 400px;
-        height: 500px;
-        background: #1e1e1e;
+        width: 440px;
+        height: 680px;
+        background: #181a1f;
 
         Rectangle {
             width: 100%;
             height: 100%;
-            background: root.refresh_counter >= 0 ? #1e1e1e : #1e1e1e;
+            background: root.refresh_counter >= 0 ? #181a1f : #181a1f;
 
             VerticalLayout {
-                padding: 30px;
-                spacing: 20px;
+                padding: 22px;
+                spacing: 14px;
                 alignment: center;
 
-                // Logo
-                Image {
-                    source: @image-url("as2p.png");
-                    width: 100px;
-                    height: 100px;
-                    horizontal-alignment: center;
-                }
-                
-                Text { 
-                    text: "AS2P Server"; 
-                    font-size: 24px; 
-                    font-weight: 800;
-                    color: white; 
-                    horizontal-alignment: center; 
-                }
-
-                // Action Area
-                VerticalLayout {
-                    spacing: 15px;
+                HorizontalLayout {
                     alignment: center;
-
-                    Button { 
-                        text: root.is_streaming ? "STOP STREAMING" : "START STREAMING"; 
-                        primary: true;
-                        height: 50px; 
-                        clicked => { root.toggle_server(); } 
-                    }
-
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 8px;
-                        Rectangle {
-                            width: 12px;
-                            height: 12px;
-                            border-radius: 6px;
-                            background: root.is_streaming ? #00ff00 : #ff5555;
-                            y: (parent.height - self.height) / 2;
-                        }
-                        Text { 
-                            text: root.status_text; 
-                            color: root.is_streaming ? #00ff00 : #ff5555; 
-                            font-size: 18px; 
-                            font-weight: 700; 
-                        }
-                    }
-                }
-
-                // Configuration / Info
-                VerticalLayout {
                     spacing: 12px;
+                    Image {
+                        source: @image-url("as2p.png");
+                        width: 44px;
+                        height: 44px;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Mobile Speaker Server";
+                            font-size: 20px;
+                            font-weight: 800;
+                            color: #ffffff;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: root.is_streaming ? #22c55e : #ef4444;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            Text {
+                                text: root.status_text;
+                                color: root.is_streaming ? #4ade80 : #f87171;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                        }
+                    }
+                }
+
+                // QR + Number-Match Pairing Card
+                Rectangle {
+                    background: #22262e;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: #323846;
+
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 10px;
+                        alignment: center;
+
+                        Text {
+                            text: "Scan QR or Match Number on Phone";
+                            color: #cbd5e1;
+                            font-size: 13px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 184px;
+                                height: 184px;
+                                background: #ffffff;
+                                border-radius: 10px;
+                                Image {
+                                    source: root.qr_image;
+                                    width: 172px;
+                                    height: 172px;
+                                    x: 6px;
+                                    y: 6px;
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 12px;
+
+                            Rectangle {
+                                background: #1e293b;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #38bdf8;
+                                height: 38px;
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    alignment: center;
+                                    Text {
+                                        text: "Pair Code: " + root.pair_code_text;
+                                        color: #38bdf8;
+                                        font-size: 16px;
+                                        font-weight: 800;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: "New Code / QR";
+                                height: 38px;
+                                clicked => { root.refresh_pairing(); }
+                            }
+                        }
+
+                        Text {
+                            text: "IPs: " + root.network_ips_text;
+                            color: #94a3b8;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                Button {
+                    text: root.is_streaming ? "STOP LISTENING / STREAM" : "START LISTENING";
+                    primary: true;
+                    height: 44px;
+                    clicked => { root.toggle_server(); }
+                }
+
+                // Toggles & Telemetry
+                VerticalLayout {
+                    spacing: 10px;
                     alignment: center;
-                    
+
                     HorizontalLayout {
                         alignment: center;
                         spacing: 10px;
-                        Text { text: "Double Send Redundancy:"; color: #cccccc; font-size: 14px; vertical-alignment: center; }
+                        Text { text: "Require QR / Code Pairing:"; color: #cbd5e1; font-size: 13px; vertical-alignment: center; }
                         Rectangle {
                             width: 20px;
                             height: 20px;
-                            background: root.redundancy_enabled ? #00ff00 : #444444;
+                            background: root.require_pairing_enabled ? #38bdf8 : #444444;
                             border-radius: 4px;
                             TouchArea {
-                                clicked => { 
+                                clicked => {
+                                    root.require_pairing_enabled = !root.require_pairing_enabled;
+                                    root.toggle_require_pairing(root.require_pairing_enabled);
+                                }
+                            }
+                            Text { text: root.require_pairing_enabled ? "✔" : ""; color: black; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 10px;
+                        Text { text: "Double Send Redundancy:"; color: #cbd5e1; font-size: 13px; vertical-alignment: center; }
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            background: root.redundancy_enabled ? #22c55e : #444444;
+                            border-radius: 4px;
+                            TouchArea {
+                                clicked => {
                                     root.redundancy_enabled = !root.redundancy_enabled;
                                     root.toggle_redundancy(root.redundancy_enabled);
                                 }
                             }
-                            Text { text: root.redundancy_enabled ? "✔" : ""; color: black; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: root.redundancy_enabled ? "✔" : ""; color: black; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
 
                     HorizontalLayout {
                         alignment: center;
                         spacing: 10px;
-                        Text { text: "Run at Startup:"; color: #cccccc; font-size: 14px; vertical-alignment: center; }
+                        Text { text: "Run at Startup:"; color: #cbd5e1; font-size: 13px; vertical-alignment: center; }
                         Rectangle {
                             width: 20px;
                             height: 20px;
-                            background: root.startup_enabled ? #00ff00 : #444444;
+                            background: root.startup_enabled ? #22c55e : #444444;
                             border-radius: 4px;
                             TouchArea {
-                                clicked => { 
+                                clicked => {
                                     root.startup_enabled = !root.startup_enabled;
                                     root.toggle_startup(root.startup_enabled);
                                 }
                             }
-                            Text { text: root.startup_enabled ? "✔" : ""; color: black; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: root.startup_enabled ? "✔" : ""; color: black; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
 
                     HorizontalLayout {
                         alignment: center;
-                        spacing: 20px;
-                        Text { text: "Bitrate: " + root.bitrate_text; color: #888888; font-size: 14px; }
-                        Text { text: "Client: " + root.client_text; color: #888888; font-size: 14px; }
+                        spacing: 18px;
+                        Text { text: "Bitrate: " + root.bitrate_text; color: #94a3b8; font-size: 12px; }
+                        Text { text: "Client: " + root.client_text; color: #94a3b8; font-size: 12px; }
                     }
                 }
 
-                Text { text: "Minimized to Tray when closed"; font-size: 12px; color: #555555; horizontal-alignment: center; }
+                Text { text: "Closing minimizes to Windows System Tray"; font-size: 11px; color: #64748b; horizontal-alignment: center; }
             }
         }
     }
@@ -146,12 +244,20 @@ slint::slint! {
 pub enum UiMessage {
     UpdateStats { packets: u64, bitrate: i32, client_ip: Option<String> },
     SyncRedundancy(bool),
+    UpdatePairing {
+        qr_rgba: Vec<u8>,
+        qr_size: u32,
+        match_code: u8,
+        ips_summary: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum UiCommand { 
+pub enum UiCommand {
     ToggleServer,
     SetRedundancy(bool),
+    SetRequirePairing(bool),
+    RefreshPairing,
 }
 
 pub struct UiState {
@@ -198,7 +304,7 @@ fn set_startup(enabled: bool) {
 pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<AppWindow>>) {
     unsafe { std::env::set_var("SLINT_BACKEND", "software"); }
     let window = AppWindow::new().expect("Failed to create Slint window");
-    
+
     let _ = handle_tx.send(window.as_weak());
 
     window.set_startup_enabled(check_startup_status());
@@ -222,8 +328,14 @@ pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<A
     let cmd_tx_redundancy = state.cmd_tx.clone();
     window.on_toggle_redundancy(move |enabled| { let _ = cmd_tx_redundancy.try_send(UiCommand::SetRedundancy(enabled)); });
 
+    let cmd_tx_pair_req = state.cmd_tx.clone();
+    window.on_toggle_require_pairing(move |enabled| { let _ = cmd_tx_pair_req.try_send(UiCommand::SetRequirePairing(enabled)); });
+
+    let cmd_tx_refresh = state.cmd_tx.clone();
+    window.on_refresh_pairing(move || { let _ = cmd_tx_refresh.try_send(UiCommand::RefreshPairing); });
+
     let window_weak_startup = window.as_weak();
-    window.on_toggle_startup(move |enabled| { 
+    window.on_toggle_startup(move |enabled| {
         set_startup(enabled);
         let ui_handle = window_weak_startup.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -246,7 +358,7 @@ pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<A
         if let Some(ui) = window_weak.upgrade() {
             let running = is_running_timer.load(Ordering::SeqCst);
             ui.set_is_streaming(running);
-            ui.set_status_text(if running { "Streaming".into() } else { "Idle".into() });
+            ui.set_status_text(if running { "Listening / Active".into() } else { "Idle".into() });
             while let Ok(msg) = stats_rx_timer.try_recv() {
                 match msg {
                     UiMessage::UpdateStats { packets, bitrate, client_ip } => {
@@ -256,6 +368,18 @@ pub fn run_ui(state: UiState, handle_tx: crossbeam_channel::Sender<slint::Weak<A
                     }
                     UiMessage::SyncRedundancy(enabled) => {
                         ui.set_redundancy_enabled(enabled);
+                    }
+                    UiMessage::UpdatePairing { qr_rgba, qr_size, match_code, ips_summary } => {
+                        if qr_size > 0 && qr_rgba.len() == (qr_size * qr_size * 4) as usize {
+                            let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                                &qr_rgba,
+                                qr_size,
+                                qr_size,
+                            );
+                            ui.set_qr_image(Image::from_rgba8(buf));
+                        }
+                        ui.set_pair_code_text(format!("{:02}", match_code).into());
+                        ui.set_network_ips_text(ips_summary.into());
                     }
                 }
             }

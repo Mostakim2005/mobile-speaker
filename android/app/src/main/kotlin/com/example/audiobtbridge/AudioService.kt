@@ -58,6 +58,8 @@ class AudioService : Service() {
     @Volatile private var resendSocket: DatagramSocket? = null
     @Volatile private var resendTarget: InetAddress? = null
     private val pendingResendTicks = AtomicInteger(0)
+    private var preferredServerIp: String? = null
+    private var preferredPairToken: String? = null
     
     companion object {
         private val _serviceState = MutableStateFlow(false)
@@ -75,6 +77,12 @@ class AudioService : Service() {
         private val _isSearchingFlow = MutableStateFlow(false)
         val isSearchingFlow = _isSearchingFlow.asStateFlow()
 
+        private val _connectedServerFlow = MutableStateFlow<String?>(null)
+        val connectedServerFlow = _connectedServerFlow.asStateFlow()
+
+        private val _pairingRequiredFlow = MutableStateFlow(false)
+        val pairingRequiredFlow = _pairingRequiredFlow.asStateFlow()
+
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
         const val ACTION_UPDATE_MODE = "ACTION_UPDATE_MODE"
@@ -89,6 +97,8 @@ class AudioService : Service() {
         const val EXTRA_BUFFER_SIZE = "EXTRA_BUFFER_SIZE"
         const val EXTRA_PCM_TARGET = "EXTRA_PCM_TARGET"
         const val EXTRA_CATCHUP = "EXTRA_CATCHUP"
+        const val EXTRA_SERVER_IP = "EXTRA_SERVER_IP"
+        const val EXTRA_PAIR_TOKEN = "EXTRA_PAIR_TOKEN"
         private const val CHANNEL_ID = "audio_stream_channel"
 
         // Server packet header (v9), measured after the 10-byte "AS2P_AUDIO" prefix.
@@ -261,22 +271,27 @@ class AudioService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> if (!isRunning) {
-                // stopSelf() tears the service instance down, so a reconnect runs on a brand
-                // new instance whose isUiVisible is back to its false default. ACTION_START
-                // only ever comes from the CONNECT button, so the UI is on screen by
-                // definition here — re-assert it, otherwise the stats loop never runs and
-                // the latency readout stays at 0.
-                isUiVisible = true
-                startAudioService()
-            } else {
-                // Already streaming. A second ACTION_START still reaches us whenever the
-                // CONNECT button is tapped twice before Compose recomposes, and Android
-                // requires a startForeground() for *every* startForegroundService() call:
-                // skipping it crashes the app ~5s later with
-                // ForegroundServiceDidNotStartInTimeException. Re-asserting the
-                // foreground state is harmless when it is already foreground.
-                currentNotification?.let { promoteToForeground(it) }
+            ACTION_START -> {
+                val prefs = getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
+                val incomingIp = intent.getStringExtra(EXTRA_SERVER_IP) ?: prefs.getString("last_server_ip", null)
+                val incomingToken = intent.getStringExtra(EXTRA_PAIR_TOKEN) ?: prefs.getString("last_pair_token", null)
+                val previousIp = preferredServerIp
+                preferredServerIp = incomingIp
+                preferredPairToken = incomingToken
+                _pairingRequiredFlow.value = false
+
+                if (!isRunning) {
+                    isUiVisible = true
+                    startAudioService()
+                } else {
+                    if (incomingIp != null && incomingIp != previousIp && incomingIp != serverAddress?.hostAddress) {
+                        clearServerConnection()
+                        _isSearchingFlow.value = true
+                        NativeBridge.resetAudio()
+                        connectionManager.reset()
+                    }
+                    currentNotification?.let { promoteToForeground(it) }
+                }
             }
             ACTION_STOP -> {
                 // Do not clear serverAddress here, as it's needed by sendGoodbyeToServer() in onDestroy()
@@ -469,6 +484,8 @@ class AudioService : Service() {
                             if (serverAddress == null) {
                                 serverAddress = packet.address
                                 resendTarget = packet.address
+                                _connectedServerFlow.value = packet.address.hostAddress
+                                _pairingRequiredFlow.value = false
                                 Log.i("AS2P_Diag", "[Conn] Server Address set to: ${packet.address}")
                                 _isSearchingFlow.value = false
                                 mediaSession?.setPlaybackState(PlaybackStateCompat.Builder().setState(PlaybackStateCompat.STATE_PLAYING, 0, 1.0f).build())
@@ -483,8 +500,12 @@ class AudioService : Service() {
                                 lastAudioTime = System.currentTimeMillis()
                                 configRetryCount = 0
                             }
+                        } else if (len >= 18 && String(data, 0, 18) == "AS2P_PAIR_REQUIRED") {
+                            _pairingRequiredFlow.value = true
+                            log("Pairing required — use QR or Number Match")
                         } else if (len > 10 && String(data, 0, 10) == "AS2P_AUDIO") {
-                            _isSearchingFlow.value = false 
+                            _isSearchingFlow.value = false
+                            _pairingRequiredFlow.value = false
                             lastAudioTime = System.currentTimeMillis()
                             configRetryCount = 0
 
@@ -495,6 +516,7 @@ class AudioService : Service() {
                             if (serverAddress == null) {
                                 serverAddress = packet.address
                                 resendTarget = packet.address
+                                _connectedServerFlow.value = packet.address.hostAddress
                                 _isSearchingFlow.value = false
                                 mediaSession?.setPlaybackState(
                                     PlaybackStateCompat.Builder()
@@ -678,23 +700,31 @@ class AudioService : Service() {
      * interface's route.
      */
     private fun broadcastDiscovery(msg: ByteArray) {
-        val targets = LinkedHashSet<InetAddress>()
-        try { targets.add(InetAddress.getByName("255.255.255.255")) } catch (e: Exception) {}
-        try {
-            for (nif in NetworkInterface.getNetworkInterfaces()) {
-                if (!nif.isUp || nif.isLoopback) continue
-                for (ia in nif.interfaceAddresses) {
-                    ia.broadcast?.let { targets.add(it) }
-                }
-            }
-        } catch (e: Exception) {}
-        for (addr in targets) {
+        val (broadcasts, gateways) = PairingClient.collectGatewayAndBroadcastTargets(this)
+        val targetIps = PairingProtocol.buildProbeTargets(
+            broadcasts = broadcasts,
+            gatewayIps = gateways,
+            lastServerIp = preferredServerIp
+        )
+        val token = preferredPairToken
+        val pinnedIp = preferredServerIp
+        if (!pinnedIp.isNullOrEmpty() && !token.isNullOrEmpty()) {
             try {
+                val qrAuth = PairingProtocol.buildQrPairMessage(token)
+                DatagramSocket().use { socket ->
+                    socket.send(DatagramPacket(qrAuth, qrAuth.size, InetAddress.getByName(pinnedIp), 12345))
+                }
+                Thread.sleep(15)
+            } catch (_: Exception) {}
+        }
+        for (ip in targetIps) {
+            try {
+                val addr = InetAddress.getByName(ip)
                 DatagramSocket().use { socket ->
                     socket.broadcast = true
                     socket.send(DatagramPacket(msg, msg.size, addr, 12345))
                 }
-            } catch (e: Exception) {}
+            } catch (_: Exception) {}
         }
     }
 
@@ -760,6 +790,7 @@ class AudioService : Service() {
     private fun clearServerConnection() {
         serverAddress = null
         resendTarget = null
+        _connectedServerFlow.value = null
     }
 
     /**
@@ -920,6 +951,8 @@ class AudioService : Service() {
         abandonAudioFocus()
         _serviceState.value = false
         _isSearchingFlow.value = false
+        _connectedServerFlow.value = null
+        _pairingRequiredFlow.value = false
         _latencyFlow.value = 0.0f
         _latencyHistoryFlow.value = emptyList()
         mediaSession?.release()

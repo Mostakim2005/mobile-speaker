@@ -24,6 +24,8 @@ rand = "0.8.5"
 clap = { version = "4.5", features = ["derive"] }
 rubato = "0.16.1"
 colored = "2.1.0"
+qrcode = { version = "0.14", default-features = false }
+local-ip-address = "0.6"
 
 [build-dependencies]
 winres = "0.1"

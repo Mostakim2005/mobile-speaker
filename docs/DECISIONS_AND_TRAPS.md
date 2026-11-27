@@ -23,6 +23,15 @@
 
 ## 2. Do-Not-Touch Engineering Landmines (Traps)
 
+### [TRAP: Pairing-Replies-Must-Use-Sender-Port] | Aliases: ephemeral port, qr pair timeout, pairing reply, symmetric port
+> **1-Line Summary:** Pairing handshake replies (`AS2P_PAIR_CHALLENGE`, `AS2P_PAIR_ACK`, `AS2P_PAIR_DENY`, `AS2P_PAIR_REQUIRED`) MUST go back to the caller's exact `SocketAddr` (`addr`), never hardcoded `:12345`.
+* **Links:** `[FEATURE: QR-And-Number-Match-Pairing]`, `[FLOW: QR-And-Number-Match-Handshake]`
+* **Strict Rule:** **NEVER** rewrite `addr` to `SocketAddr::new(addr.ip(), 12345)` when replying to pairing control packets (`AS2P_QR_PAIR`, `AS2P_PAIR_PROBE`, `AS2P_PAIR_VERIFY`).
+* **Why This Trap Exists (Plain English):** Audio streaming binds port `12345` symmetrically inside `AudioService`, whereas QR scanning and Number Matching run beforehand from `MainActivity` using ephemeral `DatagramSocket()` ports. Sending replies to `:12345` causes silent pairing timeouts.
+* **Protected Code Anchors:**
+  * `server/src/main.rs :: main`
+  * `server/src/pairing.rs :: handle_packet`
+
 ### [TRAP: JNI-OnLoad-Extern-C] | Aliases: gJvm, retransmission callback, name mangling, native-lib
 > **1-Line Summary:** `JNI_OnLoad` in `native-lib.cpp` MUST stay inside `extern "C"` or the JVM never invokes it, leaving `gJvm` null and silently disabling all packet retransmission requests.
 * **Links:** `[FEATURE: Low-Latency-Oboe-Playback]`, `[SUBSYSTEM: Audio-Transport-And-Sync]`

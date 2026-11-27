@@ -1,15 +1,17 @@
 package com.example.audiobtbridge
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.compose.animation.*
-import androidx.compose.animation.core.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -18,13 +20,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -33,13 +35,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.example.audiobtbridge.latency.LatencyMode
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // 1. Load Persistence
+
         val prefs = getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
         val savedModeName = prefs.getString("latency_mode", LatencyMode.BALANCE.name)
         val initialMode = try { LatencyMode.valueOf(savedModeName!!) } catch (e: Exception) { LatencyMode.BALANCE }
@@ -49,12 +54,14 @@ class MainActivity : ComponentActivity() {
         AudioService.updatePlcEnabled(initialPlc)
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(
-                primary = Color(0xFF64FFDA),
-                surface = Color(0xFF121212),
-                background = Color(0xFF0A0A0A),
-                error = Color(0xFFFF5252)
-            )) {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF64FFDA),
+                    surface = Color(0xFF121212),
+                    background = Color(0xFF0A0A0A),
+                    error = Color(0xFFFF5252)
+                )
+            ) {
                 Surface(color = MaterialTheme.colorScheme.background) {
                     MainScreen(this)
                 }
@@ -78,10 +85,16 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun LatencyChart(history: List<Float>, modifier: Modifier = Modifier) {
     val primaryColor = MaterialTheme.colorScheme.primary
-    Box(modifier = modifier.height(120.dp).fillMaxWidth().background(Color.Black.copy(0.3f), RoundedCornerShape(16.dp)).padding(8.dp)) {
+    Box(
+        modifier = modifier
+            .height(110.dp)
+            .fillMaxWidth()
+            .background(Color.Black.copy(0.3f), RoundedCornerShape(16.dp))
+            .padding(8.dp)
+    ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             if (history.size < 2) return@Canvas
-            val maxLatency = 200f // 固定刻度以便觀察
+            val maxLatency = 200f
             val width = size.width
             val height = size.height
             val stepX = width / 60f
@@ -96,16 +109,6 @@ fun LatencyChart(history: List<Float>, modifier: Modifier = Modifier) {
     }
 }
 
-/**
- * Opens the system tethering settings screen.
- *
- * A normal app cannot switch USB tethering on itself — that needs the system-only
- * TETHER_PRIVILEGED permission — so the most we can do is deep-link the user to the
- * screen and let them flip the switch.
- *
- * Settings.ACTION_TETHER_SETTINGS is @hide in the SDK, so it is used as a literal,
- * followed by progressively broader public actions for devices that don't handle it.
- */
 private fun openTetheringSettings(context: Context) {
     val actions = listOf(
         "android.settings.TETHER_SETTINGS",
@@ -116,11 +119,25 @@ private fun openTetheringSettings(context: Context) {
         try {
             context.startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             return
-        } catch (e: ActivityNotFoundException) {
-            // Not handled on this device; fall through to the next, broader action.
-        }
+        } catch (_: ActivityNotFoundException) {}
     }
     Toast.makeText(context, "Could not open tethering settings", Toast.LENGTH_SHORT).show()
+}
+
+private fun startPairedAudioService(context: Context, serverIp: String, hostName: String, token: String) {
+    val prefs = context.getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
+    prefs.edit()
+        .putString("last_server_ip", serverIp)
+        .putString("last_server_name", hostName)
+        .putString("last_pair_token", token)
+        .apply()
+
+    val intent = Intent(context, AudioService::class.java).apply {
+        action = AudioService.ACTION_START
+        putExtra(AudioService.EXTRA_SERVER_IP, serverIp)
+        putExtra(AudioService.EXTRA_PAIR_TOKEN, token)
+    }
+    context.startForegroundService(intent)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -131,12 +148,134 @@ fun MainScreen(context: Context) {
     val history by AudioService.latencyHistoryFlow.collectAsState()
     val currentMode by AudioService.latencyModeFlow.collectAsState()
     val isSearching by AudioService.isSearchingFlow.collectAsState()
+    val connectedIp by AudioService.connectedServerFlow.collectAsState()
+    val pairingRequired by AudioService.pairingRequiredFlow.collectAsState()
+
+    val prefs = remember { context.getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE) }
+    var pairedIp by remember { mutableStateOf(prefs.getString("last_server_ip", null)) }
+    var pairedName by remember { mutableStateOf(prefs.getString("last_server_name", null)) }
+    var isPairingBusy by remember { mutableStateOf(false) }
+    var pairingStatusText by remember { mutableStateOf<String?>(null) }
+    var activeChallenge by remember { mutableStateOf<PairChallenge?>(null) }
+
+    val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
-    Column(modifier = Modifier.fillMaxSize().padding(20.dp).verticalScroll(scrollState), horizontalAlignment = Alignment.CenterHorizontally) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+    val qrLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@rememberLauncherForActivityResult
+        val parsed = PairingProtocol.parseQrPayload(contents)
+        if (parsed == null) {
+            pairingStatusText = "Not a valid Mobile Speaker QR code."
+            return@rememberLauncherForActivityResult
+        }
+        isPairingBusy = true
+        pairingStatusText = "Connecting to ${parsed.hostName}..."
+        scope.launch {
+            val res = PairingClient.pairViaQr(parsed)
+            isPairingBusy = false
+            when (res) {
+                is PairResult.Success -> {
+                    pairedIp = res.serverIp
+                    pairedName = res.hostName
+                    pairingStatusText = "Paired with ${res.hostName} (${res.serverIp})"
+                    startPairedAudioService(context, res.serverIp, res.hostName, res.token)
+                }
+                is PairResult.Failure -> {
+                    pairingStatusText = res.reason
+                }
+            }
+        }
+    }
+
+    fun launchQrScanner() {
+        val options = ScanOptions().apply {
+            setPrompt("Scan QR code on PC Mobile Speaker")
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+        }
+        qrLauncher.launch(options)
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            launchQrScanner()
+        } else {
+            pairingStatusText = "Camera denied — use Number Match instead."
+        }
+    }
+
+    activeChallenge?.let { challenge ->
+        AlertDialog(
+            onDismissRequest = { if (!isPairingBusy) activeChallenge = null },
+            title = { Text("Match number on ${challenge.hostName}", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "Tap the 2-digit number shown in Mobile Speaker on your PC (${challenge.serverIp}):",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(modifier = Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        challenge.choices.forEach { num ->
+                            FilledTonalButton(
+                                enabled = !isPairingBusy,
+                                onClick = {
+                                    isPairingBusy = true
+                                    scope.launch {
+                                        val res = PairingClient.verifyChallenge(challenge, num)
+                                        isPairingBusy = false
+                                        activeChallenge = null
+                                        when (res) {
+                                            is PairResult.Success -> {
+                                                pairedIp = res.serverIp
+                                                pairedName = res.hostName
+                                                pairingStatusText = "Paired with ${res.hostName} (${res.serverIp})"
+                                                startPairedAudioService(context, res.serverIp, res.hostName, res.token)
+                                            }
+                                            is PairResult.Failure -> {
+                                                pairingStatusText = res.reason
+                                            }
+                                        }
+                                    }
+                                },
+                                shape = CircleShape,
+                                modifier = Modifier.size(68.dp),
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Text(num, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(enabled = !isPairingBusy, onClick = { activeChallenge = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(20.dp)
+            .verticalScroll(scrollState),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
-                "PC Audio Stream to Phone",
+                "Mobile Speaker",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Black,
                 color = MaterialTheme.colorScheme.primary,
@@ -144,8 +283,6 @@ fun MainScreen(context: Context) {
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false)
             )
-            // Shortcut for the USB-tethering workflow: jump to the system screen, enable
-            // USB tethering there, then come back and tap CONNECT.
             OutlinedButton(
                 onClick = { openTetheringSettings(context) },
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
@@ -154,24 +291,106 @@ fun MainScreen(context: Context) {
                 Text("USB TETHERING", fontWeight = FontWeight.Bold, fontSize = 11.sp)
             }
         }
-        
-        Spacer(modifier = Modifier.height(20.dp))
 
-        // Latency Info Card.
-        // The "searching" state is rendered inside this card — as the status line plus a
-        // thin bar overlaid on the card's top edge — so it adds no layout height. It used
-        // to be a separate line under the title, which pushed the whole screen past one page.
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Quick Pair Card (QR + Google-Style Number Matching across Wi-Fi & Hotspots)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF181B22))
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                val targetLabel = when {
+                    connectedIp != null -> "Active: ${pairedName ?: "PC"} ($connectedIp)"
+                    pairedIp != null -> "Saved PC: ${pairedName ?: "PC"} ($pairedIp)"
+                    else -> "Scan QR or Match Number to Pair PC"
+                }
+                Text(
+                    text = targetLabel,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (connectedIp != null) Color(0xFF4ADE80) else Color(0xFFE2E8F0),
+                    fontWeight = FontWeight.Bold
+                )
+                if (pairingRequired) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "PC Pairing Lock is active — scan QR or tap Number Match.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                } else if (pairingStatusText != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = pairingStatusText!!,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        enabled = !isPairingBusy,
+                        onClick = {
+                            val hasCam = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.CAMERA
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (hasCam) {
+                                launchQrScanner()
+                            } else {
+                                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("SCAN QR", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+
+                    OutlinedButton(
+                        enabled = !isPairingBusy,
+                        onClick = {
+                            isPairingBusy = true
+                            pairingStatusText = "Searching Wi-Fi & Hotspot for PC..."
+                            scope.launch {
+                                val challenges = PairingClient.discoverChallenges(context, pairedIp)
+                                isPairingBusy = false
+                                if (challenges.isEmpty()) {
+                                    pairingStatusText = "No PC found. Try SCAN QR or check Wi-Fi / Hotspot."
+                                } else {
+                                    pairingStatusText = null
+                                    activeChallenge = challenges.first()
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("NUMBER MATCH", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Latency Info Card
         val isSearchingForServer = isSearching && serviceState
         Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
             Box {
-                Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(modifier = Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
                         text = if (isSearchingForServer) "SEARCHING FOR SERVER..." else if (serviceState) "ACTIVE" else "IDLE",
                         color = if (isSearchingForServer) MaterialTheme.colorScheme.primary else if (serviceState) Color.Green else Color.Gray
                     )
                     Text(text = "%.1f".format(latency), style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold)
                     Text(text = "LATENCY (MS)", style = MaterialTheme.typography.labelSmall)
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
                     LatencyChart(history = history)
                 }
                 if (isSearchingForServer) {
@@ -183,13 +402,12 @@ fun MainScreen(context: Context) {
             }
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
-        // Preset Selection
         val radioOptions = listOf(
-            LatencyMode.LOW_LATENCY, 
-            LatencyMode.BALANCE, 
-            LatencyMode.HIGH_QUALITY, 
+            LatencyMode.LOW_LATENCY,
+            LatencyMode.BALANCE,
+            LatencyMode.HIGH_QUALITY,
             LatencyMode.BEST_QUALITY,
             LatencyMode.CUSTOM_SETTING
         )
@@ -200,10 +418,7 @@ fun MainScreen(context: Context) {
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).selectable(
                         selected = selected,
                         onClick = {
-                            // Save to Prefs
-                            val prefs = context.getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
                             prefs.edit().putString("latency_mode", mode.name).apply()
-
                             AudioService.setModeOffline(mode)
                             val intent = Intent(context, AudioService::class.java).apply {
                                 action = AudioService.ACTION_UPDATE_MODE
@@ -216,10 +431,10 @@ fun MainScreen(context: Context) {
                     shape = RoundedCornerShape(12.dp),
                     color = if (selected) MaterialTheme.colorScheme.primary.copy(0.1f) else Color.Transparent
                 ) {
-                    Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = selected, onClick = null)
                         Text(
-                            text = if (mode == LatencyMode.CUSTOM_SETTING) "CUSTOM SETTING" else mode.name.replace("_", " "), 
+                            text = if (mode == LatencyMode.CUSTOM_SETTING) "CUSTOM SETTING" else mode.name.replace("_", " "),
                             modifier = Modifier.padding(start = 16.dp),
                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
                         )
@@ -228,13 +443,11 @@ fun MainScreen(context: Context) {
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // Advanced Settings - ONLY SHOW IF CUSTOM_SETTING IS SELECTED
         if (currentMode == LatencyMode.CUSTOM_SETTING) {
-            val prefs = context.getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
             var showAdvanced by remember { mutableStateOf(false) }
-            
+
             var advBitrate by remember { mutableStateOf(prefs.getInt("adv_bitrate", 160000)) }
             var advComplexity by remember { mutableStateOf(prefs.getInt("adv_complexity", 8).toFloat()) }
             var advBufferSize by remember { mutableStateOf(prefs.getInt("adv_buffer_size", 4).toFloat()) }
@@ -242,8 +455,13 @@ fun MainScreen(context: Context) {
             var advCatchup by remember { mutableStateOf(prefs.getInt("adv_catchup", 1).toFloat()) }
             var plcEnabled by remember { mutableStateOf(prefs.getBoolean("plc_enabled", true)) }
 
-            Column(modifier = Modifier.fillMaxWidth().padding(16.dp).background(Color.White.copy(0.05f), RoundedCornerShape(16.dp)).padding(16.dp)) {
-                // Collapsible Header
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .background(Color.White.copy(0.05f), RoundedCornerShape(16.dp))
+                    .padding(16.dp)
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth().selectable(selected = false, onClick = { showAdvanced = !showAdvanced }),
                     verticalAlignment = Alignment.CenterVertically,
@@ -256,7 +474,6 @@ fun MainScreen(context: Context) {
                 if (showAdvanced) {
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // PLC Switch
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -271,7 +488,6 @@ fun MainScreen(context: Context) {
 
                     Divider(modifier = Modifier.padding(vertical = 12.dp), color = Color.White.copy(0.1f))
 
-                    // Bitrate Selection
                     Text("Bitrate: ${advBitrate / 1000}k", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     val bitrates = listOf(32000, 48000, 64000, 96000, 128000, 192000, 256000, 320000)
                     Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
@@ -287,23 +503,24 @@ fun MainScreen(context: Context) {
 
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // Complexity
                     Text("Complexity: ${advComplexity.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Slider(value = advComplexity, onValueChange = { advComplexity = it }, valueRange = 0f..10f, steps = 9)
 
-                    // Total Buffer
                     Text("Total Buffer Size (Target): ${advBufferSize.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Slider(value = advBufferSize, onValueChange = { 
-                        advBufferSize = it 
+                    Slider(value = advBufferSize, onValueChange = {
+                        advBufferSize = it
                         if (advPcmTarget > advBufferSize) advPcmTarget = advBufferSize
                     }, valueRange = 1f..20f, steps = 18)
 
-                    // PCM Target
                     Text("PCM Pre-decode Target: ${advPcmTarget.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Text("Recommended: 2. Higher = Better CPU stability, Lower = Larger Jitter Buffer.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                    Slider(value = advPcmTarget, onValueChange = { advPcmTarget = it }, valueRange = 1f..advBufferSize.coerceAtLeast(1f), steps = (advBufferSize.toInt() - 2).coerceAtLeast(0))
+                    Slider(
+                        value = advPcmTarget,
+                        onValueChange = { advPcmTarget = it },
+                        valueRange = 1f..advBufferSize.coerceAtLeast(1f),
+                        steps = (advBufferSize.toInt() - 2).coerceAtLeast(0)
+                    )
 
-                    // Catch-up
                     Text("Catch-up Threshold: +${advCatchup.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Slider(value = advCatchup, onValueChange = { advCatchup = it }, valueRange = 1f..10f, steps = 8)
 
@@ -332,22 +549,21 @@ fun MainScreen(context: Context) {
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(18.dp))
 
         Button(
             onClick = {
-                // Read the state once: the action and the start API must agree, or we
-                // could send ACTION_STOP through startForegroundService() and the
-                // service would be killed for never calling startForeground().
                 val isStreaming = serviceState
                 val intent = Intent(context, AudioService::class.java).apply {
                     action = if (isStreaming) AudioService.ACTION_STOP else AudioService.ACTION_START
                 }
                 if (isStreaming) context.startService(intent) else context.startForegroundService(intent)
             },
-            modifier = Modifier.fillMaxWidth().height(64.dp),
-            shape = RoundedCornerShape(32.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = if (serviceState) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+            modifier = Modifier.fillMaxWidth().height(60.dp),
+            shape = RoundedCornerShape(30.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (serviceState) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+            )
         ) {
             Text(if (serviceState) "STOP" else "CONNECT", fontWeight = FontWeight.Bold)
         }

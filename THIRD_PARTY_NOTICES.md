@@ -13,6 +13,8 @@ This repository is forked from [`anton1615/PC-Audio-Stream-to-Phone`](https://gi
 | `slint` | GPL-3.0 / Royalty-free | 1.9.1 | https://slint.dev/ | Desktop GUI toolkit (`renderer-software`). |
 | `oboe` | Apache-2.0 | FetchContent | https://github.com/google/oboe | Low-latency Android C++ audio output (AAudio / OpenSL ES). |
 | `tokio` / `tray-icon` / `mdns-sd` | MIT / Apache-2.0 | Cargo crates | https://crates.io/ | Async networking, Windows tray integration, mDNS discovery. |
+| `qrcode` / `local-ip-address` | MIT / Apache-2.0 | 0.14 / 0.6 | https://crates.io/ | Local IPv4 interface enumeration and pure-Rust QR generation. |
+| `zxing-android-embedded` | Apache-2.0 | 4.3.0 | https://github.com/journeyapps/zxing-android-embedded | Offline-capable Android QR code camera scanner (`ScanContract`). |
 | AndroidX / Jetpack Compose / Material 3 | Apache-2.0 | BOM 2023.03.00 | https://developer.android.com/jetpack | Android UI framework and MediaStyle foreground service. |
 
 ## Build / test only — not shipped

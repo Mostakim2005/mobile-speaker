@@ -7,8 +7,12 @@ pub struct DiscoveryServer {
 
 impl DiscoveryServer {
     pub fn new() -> Self {
-        let daemon = ServiceDaemon::new().expect("Failed to create mDNS daemon");
-        Self { daemon }
+        Self::try_new().expect("Failed to create mDNS daemon")
+    }
+
+    pub fn try_new() -> Result<Self, String> {
+        let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
+        Ok(Self { daemon })
     }
 
     pub fn start_broadcast(&self, port: u16) -> Result<(), String> {
