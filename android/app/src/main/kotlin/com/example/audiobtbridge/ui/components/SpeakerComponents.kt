@@ -8,8 +8,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -176,9 +174,9 @@ fun HeroStatusCard(
                     ) {
                         Icon(
                             imageVector = when {
-                                isSearchingForServer -> Icons.Rounded.Wifi
-                                serviceState -> Icons.Rounded.GraphicEq
-                                else -> Icons.Rounded.Speaker
+                                isSearchingForServer -> SpeakerIcons.Wifi
+                                serviceState -> SpeakerIcons.GraphicEq
+                                else -> SpeakerIcons.Speaker
                             },
                             contentDescription = null,
                             tint = pillFg,
@@ -248,7 +246,7 @@ fun HeroStatusCard(
                 )
             ) {
                 Icon(
-                    imageVector = if (serviceState) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
+                    imageVector = if (serviceState) SpeakerIcons.Stop else SpeakerIcons.PlayArrow,
                     contentDescription = null,
                     modifier = Modifier.size(22.dp)
                 )
@@ -301,7 +299,7 @@ fun QuickPairCard(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.Warning,
+                            imageVector = SpeakerIcons.Warning,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.onErrorContainer,
                             modifier = Modifier.size(18.dp)
@@ -337,7 +335,7 @@ fun QuickPairCard(
                     shape = RoundedCornerShape(16.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.QrCodeScanner,
+                        imageVector = SpeakerIcons.QrCodeScanner,
                         contentDescription = null,
                         modifier = Modifier.size(18.dp)
                     )
@@ -354,7 +352,7 @@ fun QuickPairCard(
                     shape = RoundedCornerShape(16.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Pin,
+                        imageVector = SpeakerIcons.Pin,
                         contentDescription = null,
                         modifier = Modifier.size(18.dp)
                     )
@@ -408,7 +406,7 @@ fun SavedPcsSection(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Icon(
-                            imageVector = if (isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.Computer,
+                            imageVector = if (isSelected) SpeakerIcons.CheckCircle else SpeakerIcons.Computer,
                             contentDescription = null,
                             tint = if (isSelected) {
                                 MaterialTheme.colorScheme.onPrimaryContainer
@@ -443,7 +441,7 @@ fun SavedPcsSection(
                             modifier = Modifier.size(28.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.Close,
+                                imageVector = SpeakerIcons.Close,
                                 contentDescription = "Remove saved PC",
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(16.dp)
@@ -479,7 +477,7 @@ fun QualityPresetSection(
             )
             TextButton(onClick = onOpenTuningSheet) {
                 Icon(
-                    imageVector = Icons.Rounded.Tune,
+                    imageVector = SpeakerIcons.Tune,
                     contentDescription = null,
                     modifier = Modifier.size(16.dp)
                 )
@@ -534,7 +532,7 @@ fun NumberMatchDialog(
         onDismissRequest = { if (!isBusy) onDismiss() },
         icon = {
             Icon(
-                imageVector = Icons.Rounded.Pin,
+                imageVector = SpeakerIcons.Pin,
                 contentDescription = null
             )
         },

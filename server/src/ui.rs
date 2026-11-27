@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc as tokio_mpsc;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HWND};
+use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_NULL, FindWindowW, ShowWindow, SW_HIDE};
 use windows::core::w;
@@ -102,7 +102,7 @@ slint::slint! {
                     border-radius: 9px;
                     y: 3px;
                     x: root.checked ? 23px : 3px;
-                    background: root.checked ? root.accent_fg : #ffffff;
+                    background: root.checked ? root.accent_fg : rgb(255, 255, 255);
                 }
             }
         }
@@ -132,25 +132,25 @@ slint::slint! {
         callback refresh_pairing();
         callback copy_pair_code();
 
-        // Google Cobalt Material 3 Tonal Tokens (Light & Dark parity)
-        property <color> bg_surface: root.is_dark ? #0b0f17 : #f6f8fc;
-        property <color> card_surface: root.is_dark ? #121826 : #ffffff;
-        property <color> tonal_surface: root.is_dark ? #192234 : #edf2fa;
-        property <color> border_subtle: root.is_dark ? #334155 : #cbd5e1;
-        property <color> text_primary: root.is_dark ? #f1f5f9 : #111827;
-        property <color> text_secondary: root.is_dark ? #cbd5e1 : #475569;
-        property <color> text_muted: root.is_dark ? #94a3b8 : #526075;
-        property <color> accent: root.is_dark ? #93c5fd : #1d4ed8;
-        property <color> accent_hover: root.is_dark ? #bfdbfe : #1d40af;
-        property <color> accent_text: root.is_dark ? #0b1220 : #ffffff;
-        property <color> accent_soft: root.is_dark ? #1d3a8a : #dbeafe;
-        property <color> accent_soft_text: root.is_dark ? #dbeafe : #1d3a8a;
-        property <color> ok_bg: root.is_dark ? #064e3b : #d1fae5;
-        property <color> ok_fg: root.is_dark ? #34d399 : #047857;
-        property <color> ok_text: root.is_dark ? #d1fae5 : #065f46;
-        property <color> danger_bg: root.is_dark ? #7f1d1d : #fee2e2;
-        property <color> danger_hover: root.is_dark ? #991b1b : #fecaca;
-        property <color> danger_fg: root.is_dark ? #fee2e2 : #b91c1c;
+        // Google Cobalt Material 3 Tonal Tokens (Light & Dark parity via rgb() to avoid Rust literal collisions)
+        property <color> bg_surface: root.is_dark ? rgb(11, 15, 23) : rgb(246, 248, 252);
+        property <color> card_surface: root.is_dark ? rgb(18, 24, 38) : rgb(255, 255, 255);
+        property <color> tonal_surface: root.is_dark ? rgb(25, 34, 52) : rgb(237, 242, 250);
+        property <color> border_subtle: root.is_dark ? rgb(51, 65, 85) : rgb(203, 213, 225);
+        property <color> text_primary: root.is_dark ? rgb(241, 245, 249) : rgb(17, 24, 39);
+        property <color> text_secondary: root.is_dark ? rgb(203, 213, 225) : rgb(71, 85, 105);
+        property <color> text_muted: root.is_dark ? rgb(148, 163, 184) : rgb(82, 96, 117);
+        property <color> accent: root.is_dark ? rgb(147, 197, 253) : rgb(29, 78, 216);
+        property <color> accent_hover: root.is_dark ? rgb(191, 219, 254) : rgb(30, 64, 175);
+        property <color> accent_text: root.is_dark ? rgb(11, 18, 32) : rgb(255, 255, 255);
+        property <color> accent_soft: root.is_dark ? rgb(30, 58, 138) : rgb(219, 234, 254);
+        property <color> accent_soft_text: root.is_dark ? rgb(219, 234, 254) : rgb(30, 58, 138);
+        property <color> ok_bg: root.is_dark ? rgb(6, 78, 59) : rgb(209, 250, 229);
+        property <color> ok_fg: root.is_dark ? rgb(52, 211, 153) : rgb(4, 120, 87);
+        property <color> ok_text: root.is_dark ? rgb(209, 250, 229) : rgb(6, 95, 70);
+        property <color> danger_bg: root.is_dark ? rgb(127, 29, 29) : rgb(254, 226, 226);
+        property <color> danger_hover: root.is_dark ? rgb(153, 27, 27) : rgb(254, 202, 202);
+        property <color> danger_fg: root.is_dark ? rgb(254, 226, 226) : rgb(185, 28, 28);
 
         title: "AS2P_SERVER_UI";
         icon: @image-url("as2p.png");
@@ -249,7 +249,7 @@ slint::slint! {
                             Rectangle {
                                 width: 184px;
                                 height: 184px;
-                                background: #ffffff;
+                                background: rgb(255, 255, 255);
                                 border-radius: 16px;
                                 border-width: 1px;
                                 border-color: root.border_subtle;

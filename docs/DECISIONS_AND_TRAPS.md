@@ -31,11 +31,11 @@
 
 ## 2. Do-Not-Touch Engineering Landmines (Traps)
 
-### [TRAP: Slint-Macro-Hex-Exponent-Lexer] | Aliases: expected at least one digit in exponent, slint hex color, rust macro lexer
-> **1-Line Summary:** Never write hex color literals inside Rust `slint::slint!` whose digits end with `e` or `E` (such as `#22262e` or `#1e3a8a`) because Rust's tokenizer mistakes them for malformed scientific-notation floats.
+### [TRAP: Slint-Macro-Hex-Exponent-Lexer] | Aliases: expected at least one digit in exponent, base 2 literal, slint hex color, rust macro lexer
+> **1-Line Summary:** Never write hex color literals inside Rust `slint::slint!` because Rust's tokenizer parses `#0b...` as binary literals and `#...e...` as malformed float exponents; always use `rgb(r, g, b)`.
 * **Links:** `[FEATURE: Material-You-And-Saved-PCs]`, `[FLOW: Material-You-Theme-And-Saved-PCs]`
-* **Strict Rule:** **NEVER** place `<digits>[eE]` hex literals like `#22262e` or `#1e3a8a` inside `slint::slint! { ... }` in `server/src/ui.rs`; adjust by 1 hex step (e.g., `#1d3a8a`) or use `rgb()`.
-* **Why This Trap Exists (Plain English):** Rust tokenizes macro input before Slint parses it, so `#1e3a8a` is lexed as float `1e3` with invalid suffix `a8a` and fails compilation.
+* **Strict Rule:** **NEVER** use hex color literals (like `#0b1220`, `#22262e`, `#1e3a8a`) inside `slint::slint! { ... }` in `server/src/ui.rs`; use `rgb(r, g, b)` instead.
+* **Why This Trap Exists (Plain English):** Rust tokenizes macro input before Slint parses it, so `#0b1220` is lexed as an invalid base-2 literal (`0b1220`) and `#1e3a8a` as a broken float (`1e3` + suffix `a8a`). `rgb(r, g, b)` bypasses Rust's number-prefix lexer completely.
 * **Protected Code Anchors:**
   * `server/src/ui.rs :: AppWindow`
 

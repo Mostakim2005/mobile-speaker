@@ -16,7 +16,7 @@ This repository is forked from [`anton1615/PC-Audio-Stream-to-Phone`](https://gi
 | `qrcode` / `local-ip-address` | MIT / Apache-2.0 | 0.14 / 0.6 | https://crates.io/ | Local IPv4 interface enumeration and pure-Rust QR generation. |
 | `arboard` | MIT / Apache-2.0 | 3.4 | https://crates.io/crates/arboard | Cross-platform clipboard copy for match codes in Windows UI. |
 | `zxing-android-embedded` | Apache-2.0 | 4.3.0 | https://github.com/journeyapps/zxing-android-embedded | Offline-capable Android QR code camera scanner (`ScanContract`). |
-| AndroidX / Compose BOM / Material Icons Extended | Apache-2.0 | BOM 2024.02.00 | https://developer.android.com/jetpack | Material You Dynamic Color, Bottom Sheet, Material Rounded icons, and MediaStyle foreground service. |
+| AndroidX / Compose BOM 2024.02.00 | Apache-2.0 | BOM 2024.02.00 | https://developer.android.com/jetpack | Material You Dynamic Color, Bottom Sheet, custom vector icons, and MediaStyle foreground service. |
 
 ## Build / test only — not shipped
 

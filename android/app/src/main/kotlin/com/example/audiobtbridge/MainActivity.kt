@@ -16,9 +16,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Tune
-import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -220,13 +217,13 @@ fun MainScreen(context: Context) {
                 actions = {
                     IconButton(onClick = { openTetheringSettings(context) }) {
                         Icon(
-                            imageVector = Icons.Rounded.Usb,
+                            imageVector = SpeakerIcons.Usb,
                             contentDescription = "USB Tethering Settings"
                         )
                     }
                     IconButton(onClick = { showTuningSheet = true }) {
                         Icon(
-                            imageVector = Icons.Rounded.Tune,
+                            imageVector = SpeakerIcons.Tune,
                             contentDescription = "Audio Tuning"
                         )
                     }
