@@ -1,0 +1,157 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.example.audiobtbridge'
+    compileSdk 34
+    ndkVersion "25.1.8937393"
+
+    // 自動生成版本號 (yyMMddHHmm)
+    def date = new Date()
+    def autoVersionCode = Integer.parseInt(date.format('yyMMddHH'))
+
+    // Release signing: the private key is NOT in this repository.
+    // See RELEASING.md for how to create it, back it up and restore it.
+    // Local builds : put keystore.properties next to this file (android/keystore.properties),
+    //                e.g. storeFile=as2p-release.keystore  (relative to android/) or an absolute path.
+    // CI builds    : .github/workflows/release.yml writes the same file from GitHub Actions secrets.
+    // Environment  : AS2P_KEYSTORE_FILE / AS2P_KEYSTORE_PASSWORD / AS2P_KEY_ALIAS / AS2P_KEY_PASSWORD.
+    def signingProps = new Properties()
+    def signingPropsFile = rootProject.file('keystore.properties')
+    if (signingPropsFile.exists()) {
+        signingPropsFile.withInputStream { signingProps.load(it) }
+    }
+    def pick = { String prop, String env ->
+        signingProps.getProperty(prop) ?: System.getenv(env)
+    }
+    def releaseStoreFile = pick('storeFile', 'AS2P_KEYSTORE_FILE')
+    def releaseStorePassword = pick('storePassword', 'AS2P_KEYSTORE_PASSWORD')
+    def releaseKeyAlias = pick('keyAlias', 'AS2P_KEY_ALIAS')
+    def releaseKeyPassword = pick('keyPassword', 'AS2P_KEY_PASSWORD')
+    def hasReleaseSigning = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                def store = new File(releaseStoreFile)
+                storeFile store.isAbsolute() ? store : rootProject.file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    // A release build without a key would silently produce an unsigned APK, so fail loudly instead.
+    gradle.taskGraph.whenReady { graph ->
+        def wantsRelease = graph.allTasks.any { it.name.toLowerCase().contains('release') }
+        if (wantsRelease && !hasReleaseSigning) {
+            throw new GradleException(
+                    "Release signing is not configured. Provide android/keystore.properties " +
+                    "or the AS2P_KEYSTORE_FILE / AS2P_KEYSTORE_PASSWORD / AS2P_KEY_ALIAS / " +
+                    "AS2P_KEY_PASSWORD environment variables. See RELEASING.md.")
+        }
+    }
+
+    // Optional offline builds: point CMake's FetchContent at sources that are
+    // already on disk, so Oboe/Opus do not have to be downloaded.
+    // Configure it in your user-level ~/.gradle/gradle.properties (never committed):
+    //   as2p.oboeSourceDir=C:/path/to/oboe
+    //   as2p.opusSourceDir=C:/path/to/opus
+    // Without these properties the normal FetchContent download is used.
+    def cmakeArgs = [
+            "-DANDROID_STL=c++_static",
+            "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,-z,separate-code",
+            "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,-z,separate-code",
+    ]
+    def oboeSourceDir = project.findProperty("as2p.oboeSourceDir")
+    if (oboeSourceDir) cmakeArgs << "-DFETCHCONTENT_SOURCE_DIR_OBOE=${oboeSourceDir}"
+    def opusSourceDir = project.findProperty("as2p.opusSourceDir")
+    if (opusSourceDir) cmakeArgs << "-DFETCHCONTENT_SOURCE_DIR_OPUS=${opusSourceDir}"
+
+    defaultConfig {
+        applicationId "com.example.audiobtbridge"
+        minSdk 28
+        targetSdk 34
+        versionCode autoVersionCode
+        versionName "1.3.4"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary true
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+                arguments(*cmakeArgs)
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // No explicit signingConfig: AGP uses the per-machine default debug key
+            // (~/.android/debug.keystore). Debug builds are not published.
+            packaging {
+                jniLibs {
+                    useLegacyPackaging = false
+                }
+            }
+        }
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+    buildFeatures {
+        compose true
+        prefab true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.4'
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.10.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.1'
+    implementation 'androidx.activity:activity-compose:1.7.2'
+    implementation 'androidx.media:media:1.6.0'
+    implementation platform('androidx.compose:compose-bom:2023.03.00')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    
+    // Oboe will be built from source in CMake
+
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+    androidTestImplementation platform('androidx.compose:compose-bom:2023.03.00')
+    androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
+}

@@ -1,0 +1,574 @@
+#![windows_subsystem = "windows"]
+
+use std::sync::{Arc};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc as tokio_mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tray_icon::{
+    menu::{Menu, MenuItem, MenuEvent},
+    TrayIconBuilder, TrayIconEvent, Icon
+};
+use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, GetCurrentThreadId
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetMessageW, TranslateMessage, DispatchMessageW, MSG,
+    FindWindowW, ShowWindow, SW_HIDE, SW_SHOW, SW_RESTORE, SetForegroundWindow, IsWindowVisible,
+    PostQuitMessage
+};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
+use windows::Win32::Foundation::HWND;
+use windows::core::{w};
+use crossbeam_channel::{unbounded};
+use slint::ComponentHandle;
+use image::ImageReader;
+use std::io::Cursor;
+use clap::Parser;
+use colored::*;
+
+mod audio;
+mod encoder;
+mod network;
+mod ui;
+
+use crate::audio::{AudioCapturer, CaptureEvent};
+use crate::encoder::{create_encoder, encode_frame, configure_encoder, validate_config};
+use crate::network::{parse_resend_request, ResendCache, UdpSender};
+use crate::ui::{UiMessage, UiCommand, UiState, AppWindow};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value_t = false)]
+    debug: bool,
+    #[arg(long, default_value_t = 0.0)]
+    drop_rate: f32,
+}
+
+#[derive(PartialEq, Debug)]
+enum ServerState {
+    Idle,
+    Listening,
+    Streaming,
+    Stopping,
+}
+
+enum WorkerCommand {
+    Reconfigure(i32, i32),
+    SetRedundancy(bool),
+    /// Receiver asked for the packet carrying this media tick.
+    Resend(u64),
+}
+
+/// Send-side counters plus the client's own measurements.
+///
+/// The client reports its view (latency, loss, underruns) in `AS2P_STATS`
+/// packets; the server cannot infer any of that from its own send path, and
+/// without it there is no way to tell whether the adaptive buffer is actually
+/// helping or just adding latency.
+#[derive(Default)]
+struct StreamStats {
+    packets_sent: std::sync::atomic::AtomicU64,
+    bytes_sent: std::sync::atomic::AtomicU64,
+    resend_requests: std::sync::atomic::AtomicU64,
+    resends_served: std::sync::atomic::AtomicU64,
+    resend_misses: std::sync::atomic::AtomicU64,
+    client_max_latency_ms: std::sync::atomic::AtomicU32,
+    client_avg_latency_ms: std::sync::atomic::AtomicU32,
+    client_late_percent_x100: std::sync::atomic::AtomicU32,
+    client_loss_percent_x100: std::sync::atomic::AtomicU32,
+    client_underflows: std::sync::atomic::AtomicU32,
+}
+
+/// `AS2P_STATS` + 5 x u32 (little-endian):
+/// max latency ms, average latency ms, late-packet percent x100,
+/// packet-loss percent x100, underflow count.
+const STATS_PREFIX: &[u8] = b"AS2P_STATS";
+const STATS_LEN: usize = 10 + 5 * 4;
+
+fn parse_client_stats(buf: &[u8]) -> Option<[u32; 5]> {
+    if buf.len() < STATS_LEN || &buf[0..10] != STATS_PREFIX {
+        return None;
+    }
+    let mut out = [0u32; 5];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let start = 10 + i * 4;
+        *slot = u32::from_le_bytes(buf[start..start + 4].try_into().ok()?);
+    }
+    Some(out)
+}
+
+fn load_embedded_icon() -> Icon {
+    let icon_data = include_bytes!("../../as2p.png");
+    let img = ImageReader::new(Cursor::new(icon_data)).with_guessed_format().expect("Err").decode().expect("Err").into_rgba8();
+    let width = img.width(); let height = img.height();
+    Icon::from_rgba(img.into_raw(), width, height).expect("Err")
+}
+
+fn force_window_redraw(hwnd: HWND, ui_weak: &slint::Weak<AppWindow>) {
+    let ui_weak_clone = ui_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak_clone.upgrade() {
+            ui.show().unwrap();
+            ui.window().request_redraw();
+            ui.set_refresh_counter(ui.get_refresh_counter() + 1);
+        }
+    });
+    unsafe {
+        if !hwnd.0.is_null() {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            let _ = InvalidateRect(hwnd, None, true);
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    
+    // 1. Elevate Process Priority (Real-time Mitigation)
+    unsafe {
+        let handle = GetCurrentProcess();
+        if let Err(e) = SetPriorityClass(handle, HIGH_PRIORITY_CLASS) {
+            if args.debug { println!("{} Failed to elevate priority: {:?}", "[SYS]".red(), e); }
+        } else {
+            if args.debug { println!("{} Process priority elevated to HIGH", "[SYS]".green()); }
+        }
+    }
+
+    if args.debug {
+        println!("{}", ">>> AS2P V8 'PULSE' SERVER (DEBUG MODE) <<<".bold().bright_white().on_blue());
+    }
+
+    let is_running = Arc::new(AtomicBool::new(false));
+    let (ui_stats_tx, ui_stats_rx) = unbounded::<UiMessage>();
+    let (cmd_tx, mut cmd_rx) = tokio_mpsc::channel::<UiCommand>(10);
+    let is_ui_visible = Arc::new(AtomicBool::new(true));
+    let main_tid = unsafe { GetCurrentThreadId() };
+
+    let (ui_handle_tx, ui_handle_rx) = unbounded::<slint::Weak<AppWindow>>();
+    let is_running_ui = is_running.clone();
+    let is_ui_visible_ui = is_ui_visible.clone();
+    let cmd_tx_ui = cmd_tx.clone();
+    std::thread::spawn(move || {
+        ui::run_ui(UiState { is_running: is_running_ui, stats_rx: ui_stats_rx, cmd_tx: cmd_tx_ui, is_ui_visible: is_ui_visible_ui, main_thread_id: main_tid, }, ui_handle_tx);
+    });
+    let ui_weak = ui_handle_rx.recv().expect("Err");
+
+    let ui_stats_tx_server = ui_stats_tx.clone();
+    let is_running_server = is_running.clone();
+    let is_ui_visible_server = is_ui_visible.clone();
+    let debug_mode = args.debug;
+    let drop_rate = args.drop_rate;
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let mut state = ServerState::Listening; // Auto-start
+            is_running_server.store(true, Ordering::SeqCst); // Sync atomic
+            
+            // Re-evaluating UI sync: 
+            // The UI thread reads `is_running` every 250ms (in run_ui -> timer).
+            // So simply setting `is_running` to true and `state` to Listening is enough for UI visual.
+            // But we need to make sure the loop logic handles this.
+            
+            // Re-evaluating UI sync: 
+            // The UI thread reads `is_running` every 250ms (in run_ui -> timer).
+            // So simply setting `is_running` to true and `state` to Listening is enough for UI visual.
+            // But we need to make sure the loop logic handles this.
+            
+            let mut redundancy = false;
+            let mut current_bitrate = 160000;
+            let mut current_complexity = 5;
+
+            // Delayed Startup (Defender Mitigation)
+            if debug_mode { println!("{} Initializing... (Delayed start)", "[SYS]".yellow()); }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            loop {
+                match state {
+                    ServerState::Idle => {
+                        is_running_server.store(false, Ordering::SeqCst);
+                        while let Some(cmd) = cmd_rx.recv().await {
+                            match cmd {
+                                UiCommand::ToggleServer => { state = ServerState::Listening; break; }
+                                UiCommand::SetRedundancy(r) => redundancy = r,
+                            }
+                        }
+                    }
+                    ServerState::Listening => {
+                        is_running_server.store(true, Ordering::SeqCst);
+                        if debug_mode { println!("{} Waiting for AS2P_DISCOVER...", "[CONN]".blue()); }
+                        
+                        let socket = Arc::new(bind_socket(12345).expect("Err"));
+                        
+                        // Flush socket buffer to prevent ghost connections
+                        let mut flush_buf = [0u8; 1024];
+                        while let Ok(_) = socket.try_recv(&mut flush_buf) {}
+
+                        let mut buf = [0u8; 1024];
+                        let mut target_addr: Option<std::net::SocketAddr> = None;
+
+                        loop {
+                            tokio::select! {
+                                msg = cmd_rx.recv() => {
+                                    match msg {
+                                        Some(UiCommand::ToggleServer) => { state = ServerState::Idle; break; }
+                                        Some(UiCommand::SetRedundancy(r)) => redundancy = r,
+                                        _ => {}
+                                    }
+                                }
+                                result = socket.recv_from(&mut buf) => {
+                                    if let Ok((len, addr)) = result {
+                                        if len >= 13 && &buf[0..13] == b"AS2P_DISCOVER" {
+                                            let fixed_addr = std::net::SocketAddr::new(addr.ip(), 12345);
+                                            target_addr = Some(fixed_addr);
+                                            let _ = socket.send_to(b"AS2P_OFFER", fixed_addr).await;
+                                            if debug_mode { println!("{} Offer sent to {}", "[CONN]".blue(), fixed_addr); }
+                                        } else if len >= 16 && &buf[0..11] == b"AS2P_CONFIG" {
+                                            // Fix: Ensure target_addr is set if we receive CONFIG without DISCOVER (or race condition)
+                                            if target_addr.is_none() {
+                                                let fixed_addr = std::net::SocketAddr::new(addr.ip(), 12345);
+                                                target_addr = Some(fixed_addr);
+                                                if debug_mode { println!("{} Implicit connection via CONFIG from {}", "[CONN]".yellow(), fixed_addr); }
+                                            }
+
+                                            let raw_bitrate = i32::from_le_bytes(buf[11..15].try_into().unwrap());
+                                            let raw_complexity = buf[15] as i32;
+                                            let (valid_br, valid_comp) = validate_config(raw_bitrate, raw_complexity);
+                                            current_bitrate = valid_br;
+                                            current_complexity = valid_comp;
+                                            state = ServerState::Streaming;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if state == ServerState::Streaming && target_addr.is_some() {
+                            let target = target_addr.unwrap();
+                            let (worker_cmd_tx, mut worker_cmd_rx) = tokio_mpsc::channel::<WorkerCommand>(10);
+                            let (worker_stop_tx, worker_stop_rx) = tokio::sync::oneshot::channel::<()>();
+                            
+                            let sequence_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            let current_bitrate_atomic = Arc::new(std::sync::atomic::AtomicI32::new(current_bitrate));
+                            let stats = Arc::new(StreamStats::default());
+                            
+                            let socket_worker = socket.clone();
+                            let sequence_worker = sequence_atomic.clone();
+                            let bitrate_worker = current_bitrate_atomic.clone();
+                            let stats_worker = stats.clone();
+                            let debug_mode_worker = debug_mode;
+                            
+                            // 0. Audio Worker Task (Decoupled Loop)
+                            let audio_handle = tokio::spawn(async move {
+                                let mut udp_sender = UdpSender::new(socket_worker, target, debug_mode_worker, redundancy, drop_rate);
+                                let mut capturer = AudioCapturer::new(debug_mode_worker).expect("Err");
+                                let mut encoder = create_encoder().expect("Err");
+                                let _ = configure_encoder(&mut encoder, current_bitrate, current_complexity);
+                                let mut pcm_buffer = Vec::with_capacity(1920 * 10);
+                                let mut resend_cache = ResendCache::new();
+                                let start_time = std::time::Instant::now();
+                                
+                                // Media tick counts 20 ms Opus frames. It advances only when a
+                                // frame is actually transmitted, so it stays a faithful media
+                                // timeline even if the capture loop stalls.
+                                let mut media_tick: u64 = 0;
+                                
+                                let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
+                                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                                // Warm-up: pre-roll the client's jitter buffer so it can start
+                                // playing without waiting for the first real frames.
+                                if debug_mode_worker { println!("{} Sending initial 10 warm-up packets to {}", "[AUDIO]".green(), target); }
+                                let silence_pcm = vec![0.0f32; 1920];
+                                let silence_data = encode_frame(&mut encoder, &silence_pcm);
+                                for _ in 0..10 {
+                                    let ts = start_time.elapsed().as_millis() as u64;
+                                    let seq = sequence_worker.load(Ordering::SeqCst) as u32;
+                                    let _ = udp_sender.send_audio(seq, media_tick, ts, silence_data.clone()).await;
+                                    resend_cache.store(media_tick, ts, &silence_data);
+                                    stats_worker.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    stats_worker.bytes_sent.fetch_add(silence_data.len() as u64, Ordering::Relaxed);
+                                    media_tick += 1;
+                                    sequence_worker.fetch_add(1, Ordering::SeqCst);
+                                }
+
+                                let mut worker_stop_rx = worker_stop_rx;
+
+                                loop {
+                                    tokio::select! {
+                                        _ = interval.tick() => {
+                                            for _ in 0..10 {
+                                                match capturer.next_event() {
+                                                    CaptureEvent::Data(pcm) => {
+                                                        if pcm.is_empty() { break; }
+                                                        pcm_buffer.extend(pcm);
+                                                        while pcm_buffer.len() >= 1920 {
+                                                            let frame: Vec<f32> = pcm_buffer.drain(0..1920).collect();
+                                                            let data = encode_frame(&mut encoder, &frame);
+                                                            if !data.is_empty() {
+                                                                let ts = start_time.elapsed().as_millis() as u64;
+                                                                let seq = sequence_worker.load(Ordering::SeqCst) as u32;
+                                                                let _ = udp_sender.send_audio(seq, media_tick, ts, data.clone()).await;
+                                                                resend_cache.store(media_tick, ts, &data);
+                                                                stats_worker.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                                                stats_worker.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                                                media_tick += 1;
+                                                                sequence_worker.fetch_add(1, Ordering::SeqCst);
+                                                            }
+                                                        }
+                                                    }
+                                                    CaptureEvent::DeviceChanged(name) => {
+                                                        if debug_mode_worker { println!("{} Device Switched to {}", "[AUDIO]".green(), name); }
+                                                        pcm_buffer.clear();
+                                                    }
+                                                    CaptureEvent::Error(e) => {
+                                                        if debug_mode_worker { println!("{} Audio Error: {}", "[ERROR]".red(), e); }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        cmd = worker_cmd_rx.recv() => {
+                                            match cmd {
+                                                Some(WorkerCommand::Reconfigure(br, comp)) => {
+                                                    if debug_mode_worker { println!("{} Re-configuring encoder to {}bps...", "[AUDIO]".green(), br); }
+                                                    bitrate_worker.store(br, Ordering::SeqCst);
+                                                    capturer.start_fade_out();
+                                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                                    encoder = create_encoder().expect("Err");
+                                                    let _ = configure_encoder(&mut encoder, br, comp);
+                                                    let _ = capturer.reinitialize();
+                                                    pcm_buffer.clear();
+                                                    // Cached frames were encoded with the old
+                                                    // configuration; serving them after a
+                                                    // reconfigure would mix bitrates.
+                                                    resend_cache.clear();
+                                                    
+                                                    let silence_pcm = vec![0.0f32; 1920];
+                                                    let silence_data = encode_frame(&mut encoder, &silence_pcm);
+                                                    for _ in 0..10 {
+                                                        let ts = start_time.elapsed().as_millis() as u64;
+                                                        let seq = sequence_worker.load(Ordering::SeqCst) as u32;
+                                                        let _ = udp_sender.send_audio(seq, media_tick, ts, silence_data.clone()).await;
+                                                        resend_cache.store(media_tick, ts, &silence_data);
+                                                        stats_worker.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                                        stats_worker.bytes_sent.fetch_add(silence_data.len() as u64, Ordering::Relaxed);
+                                                        media_tick += 1;
+                                                        sequence_worker.fetch_add(1, Ordering::SeqCst);
+                                                    }
+                                                }
+                                                Some(WorkerCommand::SetRedundancy(r)) => {
+                                                    udp_sender.redundancy_enabled = r;
+                                                }
+                                                Some(WorkerCommand::Resend(tick)) => {
+                                                    stats_worker.resend_requests.fetch_add(1, Ordering::Relaxed);
+                                                    // Clone out of the cache so the borrow ends before the await.
+                                                    let cached = resend_cache.get(tick).map(|c| crate::network::CachedPacket {
+                                                        tick: c.tick,
+                                                        send_ts_ms: c.send_ts_ms,
+                                                        payload: c.payload.clone(),
+                                                    });
+                                                    match cached {
+                                                        Some(entry) => {
+                                                            let seq = sequence_worker.load(Ordering::SeqCst) as u32;
+                                                            let _ = udp_sender.send_retransmission(seq, &entry).await;
+                                                            stats_worker.resends_served.fetch_add(1, Ordering::Relaxed);
+                                                        }
+                                                        None => {
+                                                            stats_worker.resend_misses.fetch_add(1, Ordering::Relaxed);
+                                                            if debug_mode_worker {
+                                                                println!("{} Resend miss for tick {}", "[NET]".yellow(), tick);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                None => break,
+                                            }
+                                        }
+                                        _ = &mut worker_stop_rx => break,
+                                    }
+                                }
+                                capturer.start_fade_out();
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            });
+
+                            let mut last_activity_time = std::time::Instant::now();
+                            let mut last_ui_update_time = std::time::Instant::now();
+                            let mut last_throughput_log = std::time::Instant::now();
+
+                            loop {
+                                tokio::select! {
+                                    cmd_msg = cmd_rx.recv() => {
+                                        match cmd_msg {
+                                            Some(UiCommand::ToggleServer) => { state = ServerState::Stopping; break; }
+                                            Some(UiCommand::SetRedundancy(r)) => {
+                                                redundancy = r;
+                                                let _ = worker_cmd_tx.send(WorkerCommand::SetRedundancy(r)).await;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    result = socket.recv_from(&mut buf) => {
+                                        if let Ok((len, _)) = result {
+                                            last_activity_time = std::time::Instant::now();
+                                            if len >= 10 && &buf[0..10] == b"AS2P_ALIVE" {
+                                                continue;
+                                            } else if let Some(tick) = parse_resend_request(&buf[..len]) {
+                                                // Receiver noticed a gap and asked for this tick back.
+                                                // Non-blocking: a full command channel only means the
+                                                // audio worker is behind, and the packet is already
+                                                // too late to be useful by the time it catches up.
+                                                let _ = worker_cmd_tx.try_send(WorkerCommand::Resend(tick));
+                                            } else if let Some(client) = parse_client_stats(&buf[..len]) {
+                                                stats.client_max_latency_ms.store(client[0], Ordering::Relaxed);
+                                                stats.client_avg_latency_ms.store(client[1], Ordering::Relaxed);
+                                                stats.client_late_percent_x100.store(client[2], Ordering::Relaxed);
+                                                stats.client_loss_percent_x100.store(client[3], Ordering::Relaxed);
+                                                stats.client_underflows.store(client[4], Ordering::Relaxed);
+                                            } else if len >= 16 && &buf[0..11] == b"AS2P_CONFIG" {
+                                                let raw_bitrate = i32::from_le_bytes(buf[11..15].try_into().unwrap());
+                                                let raw_complexity = buf[15] as i32;
+                                                let (valid_bitrate, valid_complexity) = validate_config(raw_bitrate, raw_complexity);
+
+                                                if debug_mode { println!("{} Received CONFIG: {}bps, Cmp: {}", "[AUDIO]".blue(), valid_bitrate, valid_complexity); }
+
+                                                if valid_bitrate == current_bitrate && valid_complexity == current_complexity {
+                                                    continue;
+                                                }
+                                                current_bitrate = valid_bitrate;
+                                                current_complexity = valid_complexity;
+                                                let _ = worker_cmd_tx.send(WorkerCommand::Reconfigure(current_bitrate, current_complexity)).await;
+                                            } else if len >= 12 && &buf[0..12] == b"AS2P_GOODBYE" {
+                                                if debug_mode { println!("{} Client disconnected gracefully.", "[CONN]".blue()); }
+                                                state = ServerState::Listening; break;
+                                            }
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                        if last_activity_time.elapsed().as_secs() > 5 {
+                                            if debug_mode { println!("{} Client connection timed out.", "[CONN]".red()); }
+                                            state = ServerState::Listening; 
+                                            break; 
+                                        }
+                                        
+                                        if last_ui_update_time.elapsed().as_millis() >= 200 {
+                                            if is_ui_visible_server.load(Ordering::SeqCst) {
+                                                let _ = ui_stats_tx_server.send(UiMessage::UpdateStats { 
+                                                    packets: sequence_atomic.load(Ordering::SeqCst), 
+                                                    bitrate: current_bitrate_atomic.load(Ordering::SeqCst), 
+                                                    client_ip: Some(target.to_string()) 
+                                                });
+                                            }
+                                            last_ui_update_time = std::time::Instant::now();
+                                        }
+
+                                        if debug_mode && last_throughput_log.elapsed().as_secs() >= 5 {
+                                            let underflows = stats.client_underflows.load(Ordering::Relaxed);
+                                            let late = stats.client_late_percent_x100.load(Ordering::Relaxed) as f32 / 100.0;
+                                            let loss = stats.client_loss_percent_x100.load(Ordering::Relaxed) as f32 / 100.0;
+                                            println!(
+                                                "{} Streaming: Seq={}, Sent={}, Bytes={}, Resend(req/served/miss)={}/{}/{}, Client[late={:.2}%, loss={:.2}%, underruns={}]",
+                                                "[DIAG]".bright_black(),
+                                                sequence_atomic.load(Ordering::SeqCst),
+                                                stats.packets_sent.load(Ordering::Relaxed),
+                                                stats.bytes_sent.load(Ordering::Relaxed),
+                                                stats.resend_requests.load(Ordering::Relaxed),
+                                                stats.resends_served.load(Ordering::Relaxed),
+                                                stats.resend_misses.load(Ordering::Relaxed),
+                                                late,
+                                                loss,
+                                                underflows,
+                                            );
+                                            last_throughput_log = std::time::Instant::now();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Cleanup Worker
+                            let _ = worker_stop_tx.send(());
+                            let _ = audio_handle.await;
+
+                            if state == ServerState::Stopping {
+                                if debug_mode { println!("{} Stopping Stream (Graceful)...", "[CONN]".blue()); }
+                                let _ = UdpSender::new(socket.clone(), target, false, false, 0.0).send_control("AS2P_GOODBYE").await;
+                                state = ServerState::Idle;
+                            }
+                            let _ = ui_stats_tx_server.send(UiMessage::UpdateStats { packets: 0, bitrate: 0, client_ip: None });
+                        }
+                    }
+                    _ => state = ServerState::Idle,
+                }
+            }
+        });
+    });
+
+    let tray_menu = Menu::new();
+    let _ = tray_menu.append_items(&[
+        &MenuItem::with_id("toggle", "Show/Hide Window", true, None),
+        &MenuItem::with_id("server_toggle", "Start/Stop Server", true, None),
+        &MenuItem::with_id("quit", "Quit", true, None),
+    ]);
+    
+    let mut _tray = Some(TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_icon(load_embedded_icon())
+        .with_tooltip("AS2P Server")
+        .build()?);
+
+    let menu_channel = MenuEvent::receiver();
+    let tray_channel = TrayIconEvent::receiver();
+    let mut msg = MSG::default();
+    
+    let mut last_tray_state = false;
+
+    unsafe {
+        while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+            TranslateMessage(&msg); DispatchMessageW(&msg);
+            
+            let current_running = is_running.load(Ordering::SeqCst);
+            if current_running != last_tray_state {
+                if let Some(ref tray) = _tray {
+                    let _ = tray.set_tooltip(Some(if current_running { "AS2P Server (Streaming)" } else { "AS2P Server (Idle)" }));
+                }
+                last_tray_state = current_running;
+            }
+
+            let hwnd = FindWindowW(None, w!("AS2P_SERVER_UI")).unwrap_or(HWND(std::ptr::null_mut()));
+            let visible = !hwnd.0.is_null() && IsWindowVisible(hwnd).as_bool();
+            is_ui_visible.store(visible, Ordering::SeqCst);
+            
+            while let Ok(event) = menu_channel.try_recv() {
+                match event.id.0.as_str() {
+                    "toggle" => { if !hwnd.0.is_null() { if visible { ShowWindow(hwnd, SW_HIDE); } else { force_window_redraw(hwnd, &ui_weak); } } }
+                    "server_toggle" => { let _ = cmd_tx.try_send(UiCommand::ToggleServer); }
+                    "quit" => {
+                        _tray.take(); // 關鍵：先手動移除圖示
+                        PostQuitMessage(0); // 讓主迴圈結束
+                    }
+                    _ => {}
+                }
+            }
+            while let Ok(event) = tray_channel.try_recv() {
+                if let TrayIconEvent::DoubleClick { .. } = event { if !hwnd.0.is_null() { force_window_redraw(hwnd, &ui_weak); } }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_socket(port: u16) -> Result<UdpSocket, String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| e.to_string())?;
+    socket.set_reuse_address(true).map_err(|e| e.to_string())?;
+    let addr: SockAddr = format!("0.0.0.0:{}", port).parse::<std::net::SocketAddr>().map_err(|e| e.to_string())?.into();
+    socket.bind(&addr).map_err(|e| e.to_string())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    std_socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+    UdpSocket::from_std(std_socket).map_err(|e| e.to_string())
+}

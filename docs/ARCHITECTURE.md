@@ -1,8 +1,8 @@
 # System Architecture & Visual Flows (`ARCHITECTURE.md`)
-> **1-Line Summary:** Living visual map of the planned Mobile Speaker pipeline from Windows system audio capture through QR-paired Wi-Fi/USB transport to synchronized Android playback. *(Build and test commands live in root `AGENTS.md`.)*
+> **1-Line Summary:** Living visual map of Mobile Speaker (forked from AS2P), showing Windows WASAPI/Opus capture, UDP v9 + adaptive jitter buffer playback, and planned QR/number-match pairing. *(Build and test commands live in root `AGENTS.md`.)*
 
 ## 1. High-Level Visual System Map
-* **Plain-English Overview:** The Windows PC captures live speaker output via WASAPI loopback, encodes 20 ms frames with Opus (or lossless PCM over USB), and advertises a QR pairing payload over LAN/ADB. The phone app scans the QR code, connects via UDP/WebRTC over Wi-Fi or an ADB/RNDIS tunnel over USB, and feeds an adaptive jitter buffer + drift resampler into Android's low-latency audio output (AAudio/Oboe or AudioTrack).
+* **Plain-English Overview:** The Rust Windows server captures system audio via WASAPI loopback on a Pro Audio MMCSS thread, resamples to 48 kHz, and encodes 20 ms Opus frames into v9 UDP packets. The Android client receives frames on a foreground service, decodes on a `nice -16` thread through a 5-state adaptive jitter buffer, and outputs via C++ Oboe. Planned upgrades add QR + number-match pairing across Wi-Fi/hotspots and `adb reverse` wired fallback.
 
 ```mermaid
 flowchart TB
@@ -12,38 +12,45 @@ flowchart TB
     classDef outputNode fill:#15803d,stroke:#14532d,color:#ffffff
     classDef trapNode fill:#b91c1c,stroke:#7f1d1d,color:#ffffff
 
-    PC([Windows PC Audio: WASAPI Loopback]):::startNode -->|20ms PCM frames| Enc[Encoder & Packetizer: Opus + Seq/Timestamps]:::processNode
-    QR([PC QR Display: IP + Port + Session Token]):::startNode -->|scanned by phone| Pair[Handshake & Transport Selector]:::processNode
-    Enc -->|Wi-Fi UDP/WebRTC or USB ADB/RNDIS| Pair
-    Pair -->|audio packets| Jitter[Adaptive Jitter Buffer & Drift Resampler]:::processNode
-    Jitter -->|low-latency PCM| Speaker([Phone Speaker: Android AAudio / Oboe]):::outputNode
-    Enc -.->|on Windows silence| SilenceGuard[Silence-Frame Keepalive]:::trapNode
+    PC([Windows PC: WASAPI Loopback + MMCSS]):::startNode -->|resamples + 20ms Opus| Net[UDP v9 Sender + 128-Packet Resend Cache]:::processNode
+    Net -->|UDP 12345 Wi-Fi / Hotspot / USB| Svc[Android AudioService Foreground]:::processNode
+    Svc -->|raw v9 payload| Jitter[C++ AdaptiveBuffer 5-State Controller]:::processNode
+    Jitter -.->|tick gap detected| Net
+    Jitter -->|decoded PCM| Oboe([Android Oboe Exclusive Output]):::outputNode
+    JNI[extern C JNI_OnLoad Guard]:::trapNode -.->|protects resend callback| Jitter
 
     subgraph Legend["Legend (Color Guide)"]
-        L1([Blue = PC Entry & QR Pairing]):::startNode
-        L2[Teal = Encoding, Transport & Sync]:::processNode
-        L3([Green = Phone Speaker Output]):::outputNode
-        L4[Red = Silence / Drift Guard]:::trapNode
+        L1([Blue = Windows Audio Capture]):::startNode
+        L2[Teal = Opus, UDP v9, Adaptive Buffer]:::processNode
+        L3([Green = Android Speaker Output]):::outputNode
+        L4[Red = JNI / Real-Time Guard]:::trapNode
     end
 ```
 
 ## 2. Tech Stack & Why We Chose It
-*(Pending Path B user confirmation — candidate options below reflect feasibility analysis.)*
 
-| Layer | Candidate / Chosen Tool | Plain-English Reason Why |
+| Layer | Tool / Library | Plain-English Reason Why |
 | :--- | :--- | :--- |
-| PC Sender & Signaling | *(Pending Path B: Go / Python / TypeScript / Fork)* | Captures Windows WASAPI loopback, displays QR code, manages ADB/LAN transport. |
-| Audio Codec | Opus (20 ms frames, 48 kHz stereo) | Low algorithmic delay with high fidelity and resilience to Wi-Fi packet loss. |
-| Phone Receiver | *(Pending Path B: Native Android Kotlin+Oboe vs. WebRTC PWA vs. Fork)* | Needs low-latency AAudio/Oboe playback, camera QR scan, and background service stability. |
+| Windows Capture & Encode | Rust (`cpal` + `rubato` + `audiopus`) | Captures WASAPI loopback on MMCSS Pro Audio threads and encodes 48 kHz Opus with minimal CPU. |
+| Windows UI & Tray | `slint` + `tray-icon` | Lightweight single-binary desktop window and system tray control (< 0.1% idle CPU). |
+| Android UI & Lifecycle | Kotlin + Jetpack Compose + Foreground Service | Holds `PARTIAL_WAKE_LOCK`, `MulticastLock`, and MediaStyle notification so streaming survives screen off. |
+| Android Audio Engine | C++17 + `Oboe` + `libopus` + `AdaptiveBuffer` | Exclusive-mode low-latency output decoupled from network/decode threads via JNI. |
 
 ## 3. Core Subsystems & Visual Feature Flows
 
-### [SUBSYSTEM: Audio-Transport-And-Sync] | Aliases: wasapi loopback, opus, adaptive jitter buffer, qr pairing, adb forward
-> **1-Line Summary:** End-to-end audio capture, QR-bootstrapped Wi-Fi/USB transport, and clock-drift-compensated playback pipeline.
-* **Links:** `[WISHLIST: QR-Instant-Pairing]`, `[WISHLIST: Dual-Transport-WiFi-And-USB]`, `[WISHLIST: Adaptive-Sync-And-Quality]`, `[DECISION: Local-Only-Repo-Bootstrap]`, `[TRAP: WASAPI-Loopback-Silence-Stall]`, `[TRAP: Android-USB-Needs-ADB-Or-Tethering]`
-* **Plain-English Walkthrough:** The PC sender opens a WASAPI loopback stream on the active playback device and exposes a lightweight pairing endpoint encoded in a QR matrix. Scanning the QR code exchanges capabilities and RTT/clock offsets, then starts streaming timestamped audio frames over Wi-Fi or wired USB while dynamically adjusting buffer target depth to prevent underruns and cumulative latency drift.
+### [SUBSYSTEM: Audio-Transport-And-Sync] | Aliases: wasapi loopback, opus, adaptive jitter buffer, v9 packet, oboe
+> **1-Line Summary:** End-to-end Windows WASAPI capture, Opus UDP v9 streaming with on-demand retransmission, and Android 5-state adaptive Oboe playback.
+* **Links:** `[FEATURE: Adaptive-Opus-Streaming]`, `[FEATURE: Low-Latency-Oboe-Playback]`, `[FEATURE: MMCSS-WASAPI-Capture]`, `[WISHLIST: QR-And-Number-Match-Pairing]`, `[WISHLIST: Seamless-USB-ADB-And-Tethering]`, `[WISHLIST: Polished-PC-And-Android-UI]`, `[DECISION: Fork-AS2P-Over-AudioShare]`, `[DECISION: GitHub-First-Public-Repo]`, `[TRAP: JNI-OnLoad-Extern-C]`, `[TRAP: WASAPI-Loopback-Silence-Stall]`, `[TRAP: Android-USB-Needs-ADB-Or-Tethering]`
+* **Plain-English Walkthrough:** The Windows server listens on `0.0.0.0:12345`, performs `AS2P_DISCOVER`/`AS2P_OFFER` handshake + `AS2P_CONFIG`, and spawns a decoupled capture/encode worker sending v9 packets (`media_tick`, `send_ts_ms`, `flags`, `seq`). Android feeds packets into `AdaptiveBuffer`, requests resends (`AS2P_RESEND`) on gaps, and plays PCM via Oboe while reporting `AS2P_STATS` every second.
 * **Code Anchors:**
-  * *(Pending implementation after Path B confirmation; doc-parity check anchored in `local-ci.ps1 :: Test-RepoStructureAndDocParity`)*
+  * `server/src/main.rs :: main`
+  * `server/src/audio.rs :: MmcssGuard`
+  * `server/src/encoder.rs :: encode_frame`
+  * `server/src/network.rs :: UdpSender`
+  * `android/app/src/main/kotlin/com/example/audiobtbridge/AudioService.kt :: AudioService`
+  * `android/app/src/main/cpp/adaptive_buffer.h :: AdaptiveBuffer`
 
 ## 4. Recipes: How to Add New Things Safely
-*(To be populated once the chosen codebase structure is scaffolded.)*
+* **To extend pairing (QR + Number Match):**
+  1. Enumerate local IPv4 addresses + generate pairing session token/code in `server/src/` (keeping `UDP 12345` compatibility).
+  2. Display QR + 2-digit code in `server/src/ui.slint :: AppWindow` and handle scan/tap verification in `android/app/src/main/kotlin/com/example/audiobtbridge/MainActivity.kt :: MainActivity`.

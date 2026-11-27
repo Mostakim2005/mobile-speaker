@@ -2,6 +2,27 @@
 .ci-logs/
 .ci-report/
 
+# Rust
+/server/target
+/server/Cargo.lock
+
+# Android
+.gradle
+build/
+local.properties
+*.apk
+*.aab
+*.aar
+*.jks
+*.keystore
+keystore.properties
+android/keystore.properties
+android/app/*.keystore
+android/app/.cxx
+android/app/build
+android/.gradle
+*.iml
+
 # OS / Editor artifacts
 .DS_Store
 Thumbs.db
@@ -15,27 +36,3 @@ desktop.ini
 .env
 .env.*
 !.env.example
-
-# Build & Runtime Artifacts
-bin/
-dist/
-build/
-out/
-obj/
-*.exe
-*.dll
-*.so
-*.dylib
-*.apk
-*.aab
-*.log
-
-# Language Dependencies & Caches
-node_modules/
-.venv/
-venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.gradle/
-local.properties

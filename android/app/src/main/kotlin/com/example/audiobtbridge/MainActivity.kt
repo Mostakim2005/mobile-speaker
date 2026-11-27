@@ -1,0 +1,355 @@
+package com.example.audiobtbridge
+
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.audiobtbridge.latency.LatencyMode
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // 1. Load Persistence
+        val prefs = getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
+        val savedModeName = prefs.getString("latency_mode", LatencyMode.BALANCE.name)
+        val initialMode = try { LatencyMode.valueOf(savedModeName!!) } catch (e: Exception) { LatencyMode.BALANCE }
+        AudioService.setModeOffline(initialMode)
+
+        val initialPlc = prefs.getBoolean("plc_enabled", true)
+        AudioService.updatePlcEnabled(initialPlc)
+
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme(
+                primary = Color(0xFF64FFDA),
+                surface = Color(0xFF121212),
+                background = Color(0xFF0A0A0A),
+                error = Color(0xFFFF5252)
+            )) {
+                Surface(color = MaterialTheme.colorScheme.background) {
+                    MainScreen(this)
+                }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val intent = Intent(this, AudioService::class.java).apply { action = AudioService.ACTION_UI_VISIBLE }
+        startService(intent)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        val intent = Intent(this, AudioService::class.java).apply { action = AudioService.ACTION_UI_HIDDEN }
+        startService(intent)
+    }
+}
+
+@Composable
+fun LatencyChart(history: List<Float>, modifier: Modifier = Modifier) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    Box(modifier = modifier.height(120.dp).fillMaxWidth().background(Color.Black.copy(0.3f), RoundedCornerShape(16.dp)).padding(8.dp)) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            if (history.size < 2) return@Canvas
+            val maxLatency = 200f // 固定刻度以便觀察
+            val width = size.width
+            val height = size.height
+            val stepX = width / 60f
+            val path = Path()
+            history.takeLast(60).forEachIndexed { index, value ->
+                val x = index * stepX
+                val y = height - (value.coerceIn(0f, maxLatency) / maxLatency * height)
+                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            drawPath(path = path, color = primaryColor, style = Stroke(width = 2.dp.toPx()))
+        }
+    }
+}
+
+/**
+ * Opens the system tethering settings screen.
+ *
+ * A normal app cannot switch USB tethering on itself — that needs the system-only
+ * TETHER_PRIVILEGED permission — so the most we can do is deep-link the user to the
+ * screen and let them flip the switch.
+ *
+ * Settings.ACTION_TETHER_SETTINGS is @hide in the SDK, so it is used as a literal,
+ * followed by progressively broader public actions for devices that don't handle it.
+ */
+private fun openTetheringSettings(context: Context) {
+    val actions = listOf(
+        "android.settings.TETHER_SETTINGS",
+        Settings.ACTION_WIRELESS_SETTINGS,
+        Settings.ACTION_SETTINGS
+    )
+    for (action in actions) {
+        try {
+            context.startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return
+        } catch (e: ActivityNotFoundException) {
+            // Not handled on this device; fall through to the next, broader action.
+        }
+    }
+    Toast.makeText(context, "Could not open tethering settings", Toast.LENGTH_SHORT).show()
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(context: Context) {
+    val serviceState by AudioService.serviceState.collectAsState()
+    val latency by AudioService.latencyFlow.collectAsState()
+    val history by AudioService.latencyHistoryFlow.collectAsState()
+    val currentMode by AudioService.latencyModeFlow.collectAsState()
+    val isSearching by AudioService.isSearchingFlow.collectAsState()
+    val scrollState = rememberScrollState()
+
+    Column(modifier = Modifier.fillMaxSize().padding(20.dp).verticalScroll(scrollState), horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "PC Audio Stream to Phone",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Black,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            // Shortcut for the USB-tethering workflow: jump to the system screen, enable
+            // USB tethering there, then come back and tap CONNECT.
+            OutlinedButton(
+                onClick = { openTetheringSettings(context) },
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+            ) {
+                Text("USB TETHERING", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Latency Info Card.
+        // The "searching" state is rendered inside this card — as the status line plus a
+        // thin bar overlaid on the card's top edge — so it adds no layout height. It used
+        // to be a separate line under the title, which pushed the whole screen past one page.
+        val isSearchingForServer = isSearching && serviceState
+        Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
+            Box {
+                Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = if (isSearchingForServer) "SEARCHING FOR SERVER..." else if (serviceState) "ACTIVE" else "IDLE",
+                        color = if (isSearchingForServer) MaterialTheme.colorScheme.primary else if (serviceState) Color.Green else Color.Gray
+                    )
+                    Text(text = "%.1f".format(latency), style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold)
+                    Text(text = "LATENCY (MS)", style = MaterialTheme.typography.labelSmall)
+                    Spacer(modifier = Modifier.height(16.dp))
+                    LatencyChart(history = history)
+                }
+                if (isSearchingForServer) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(3.dp).align(Alignment.TopCenter),
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Preset Selection
+        val radioOptions = listOf(
+            LatencyMode.LOW_LATENCY, 
+            LatencyMode.BALANCE, 
+            LatencyMode.HIGH_QUALITY, 
+            LatencyMode.BEST_QUALITY,
+            LatencyMode.CUSTOM_SETTING
+        )
+        Column(modifier = Modifier.selectableGroup().fillMaxWidth()) {
+            radioOptions.forEach { mode ->
+                val selected = mode == currentMode
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).selectable(
+                        selected = selected,
+                        onClick = {
+                            // Save to Prefs
+                            val prefs = context.getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
+                            prefs.edit().putString("latency_mode", mode.name).apply()
+
+                            AudioService.setModeOffline(mode)
+                            val intent = Intent(context, AudioService::class.java).apply {
+                                action = AudioService.ACTION_UPDATE_MODE
+                                putExtra(AudioService.EXTRA_MODE, mode.name)
+                            }
+                            context.startService(intent)
+                        },
+                        role = Role.RadioButton
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (selected) MaterialTheme.colorScheme.primary.copy(0.1f) else Color.Transparent
+                ) {
+                    Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(selected = selected, onClick = null)
+                        Text(
+                            text = if (mode == LatencyMode.CUSTOM_SETTING) "CUSTOM SETTING" else mode.name.replace("_", " "), 
+                            modifier = Modifier.padding(start = 16.dp),
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Advanced Settings - ONLY SHOW IF CUSTOM_SETTING IS SELECTED
+        if (currentMode == LatencyMode.CUSTOM_SETTING) {
+            val prefs = context.getSharedPreferences("AS2P_Prefs", Context.MODE_PRIVATE)
+            var showAdvanced by remember { mutableStateOf(false) }
+            
+            var advBitrate by remember { mutableStateOf(prefs.getInt("adv_bitrate", 160000)) }
+            var advComplexity by remember { mutableStateOf(prefs.getInt("adv_complexity", 8).toFloat()) }
+            var advBufferSize by remember { mutableStateOf(prefs.getInt("adv_buffer_size", 4).toFloat()) }
+            var advPcmTarget by remember { mutableStateOf(prefs.getInt("adv_pcm_target", 2).toFloat()) }
+            var advCatchup by remember { mutableStateOf(prefs.getInt("adv_catchup", 1).toFloat()) }
+            var plcEnabled by remember { mutableStateOf(prefs.getBoolean("plc_enabled", true)) }
+
+            Column(modifier = Modifier.fillMaxWidth().padding(16.dp).background(Color.White.copy(0.05f), RoundedCornerShape(16.dp)).padding(16.dp)) {
+                // Collapsible Header
+                Row(
+                    modifier = Modifier.fillMaxWidth().selectable(selected = false, onClick = { showAdvanced = !showAdvanced }),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("ADVANCED TUNING", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                    Text(if (showAdvanced) "▲" else "▼", color = MaterialTheme.colorScheme.primary)
+                }
+
+                if (showAdvanced) {
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // PLC Switch
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text("Packet Loss Concealment", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text("PLC Off = Audio Drops", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        }
+                        Switch(checked = plcEnabled, onCheckedChange = { plcEnabled = it })
+                    }
+
+                    Divider(modifier = Modifier.padding(vertical = 12.dp), color = Color.White.copy(0.1f))
+
+                    // Bitrate Selection
+                    Text("Bitrate: ${advBitrate / 1000}k", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    val bitrates = listOf(32000, 48000, 64000, 96000, 128000, 192000, 256000, 320000)
+                    Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                        bitrates.forEach { br ->
+                            FilterChip(
+                                selected = advBitrate == br,
+                                onClick = { advBitrate = br },
+                                label = { Text("${br / 1000}k") },
+                                modifier = Modifier.padding(end = 4.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Complexity
+                    Text("Complexity: ${advComplexity.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Slider(value = advComplexity, onValueChange = { advComplexity = it }, valueRange = 0f..10f, steps = 9)
+
+                    // Total Buffer
+                    Text("Total Buffer Size (Target): ${advBufferSize.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Slider(value = advBufferSize, onValueChange = { 
+                        advBufferSize = it 
+                        if (advPcmTarget > advBufferSize) advPcmTarget = advBufferSize
+                    }, valueRange = 1f..20f, steps = 18)
+
+                    // PCM Target
+                    Text("PCM Pre-decode Target: ${advPcmTarget.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("Recommended: 2. Higher = Better CPU stability, Lower = Larger Jitter Buffer.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                    Slider(value = advPcmTarget, onValueChange = { advPcmTarget = it }, valueRange = 1f..advBufferSize.coerceAtLeast(1f), steps = (advBufferSize.toInt() - 2).coerceAtLeast(0))
+
+                    // Catch-up
+                    Text("Catch-up Threshold: +${advCatchup.toInt()}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Slider(value = advCatchup, onValueChange = { advCatchup = it }, valueRange = 1f..10f, steps = 8)
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Button(
+                        onClick = {
+                            prefs.edit().apply {
+                                putInt("adv_bitrate", advBitrate)
+                                putInt("adv_complexity", advComplexity.toInt())
+                                putInt("adv_buffer_size", advBufferSize.toInt())
+                                putInt("adv_pcm_target", advPcmTarget.toInt())
+                                putInt("adv_catchup", advCatchup.toInt())
+                                putBoolean("plc_enabled", plcEnabled)
+                                apply()
+                            }
+                            AudioService.applyAdvancedSettings(
+                                advBitrate, advComplexity.toInt(), advBufferSize.toInt(), advPcmTarget.toInt(), advCatchup.toInt()
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("APPLY CHANGES")
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            onClick = {
+                // Read the state once: the action and the start API must agree, or we
+                // could send ACTION_STOP through startForegroundService() and the
+                // service would be killed for never calling startForeground().
+                val isStreaming = serviceState
+                val intent = Intent(context, AudioService::class.java).apply {
+                    action = if (isStreaming) AudioService.ACTION_STOP else AudioService.ACTION_START
+                }
+                if (isStreaming) context.startService(intent) else context.startForegroundService(intent)
+            },
+            modifier = Modifier.fillMaxWidth().height(64.dp),
+            shape = RoundedCornerShape(32.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = if (serviceState) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+        ) {
+            Text(if (serviceState) "STOP" else "CONNECT", fontWeight = FontWeight.Bold)
+        }
+    }
+}
